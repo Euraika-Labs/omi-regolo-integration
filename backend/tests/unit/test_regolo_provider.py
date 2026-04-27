@@ -30,6 +30,26 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+# Pre-mock heavy deps BEFORE importing modules under test, per
+# backend/CLAUDE.md ("Pre-mock heavy deps before importing the module under
+# test"). Without this, importing utils.llm.clients will trigger real
+# `anthropic.AsyncAnthropic()` and Firestore client construction that need
+# live credentials.
+os.environ.setdefault('ENCRYPTION_SECRET', 'test_secret_for_unit_tests_only')
+os.environ.setdefault('OPENAI_API_KEY', 'sk-test-fake')
+os.environ.setdefault('ANTHROPIC_API_KEY', 'ant-test-fake')
+os.environ.setdefault('OPENROUTER_API_KEY', 'or-test-fake')
+os.environ.setdefault('GEMINI_API_KEY', 'gem-test-fake')
+os.environ.setdefault('REGOLO_API_KEY', 'reg-test-fake')
+sys.modules.setdefault('database._client', MagicMock())
+sys.modules.setdefault('database.redis_db', MagicMock())
+# database.users transitively pulls in stripe (via utils.subscription) which is
+# a heavy SaaS dep we don't need for these tests. Stub it with a MagicMock so
+# eu_privacy.py's `import database.users as users_db` returns a stub that the
+# test's @patch can target.
+sys.modules.setdefault('utils.subscription', MagicMock())
+sys.modules.setdefault('database.users', MagicMock())
+
 
 # ---------------------------------------------------------------------------
 # Classifier
@@ -75,10 +95,27 @@ class TestRegoloFactory:
     def test_thinking_models_set(self):
         from utils.llm.clients import _REGOLO_THINKING_MODELS
 
+        # Live-probed Apr 2026: every qwen-3.x family member + minimax-m2.5
+        # needs enable_thinking=False or burns the output budget on hidden
+        # reasoning tokens.
         assert 'minimax-m2.5' in _REGOLO_THINKING_MODELS
         assert 'qwen3.5-122b' in _REGOLO_THINKING_MODELS
-        # Negative — Llama is NOT a thinking model
-        assert 'Llama-3.3-70B-Instruct' not in _REGOLO_THINKING_MODELS
+        assert 'qwen3.5-9b' in _REGOLO_THINKING_MODELS
+        assert 'qwen3.6-27b' in _REGOLO_THINKING_MODELS
+        # Negatives — Llama, mistral, gpt-oss, gemma, apertus, qwen3-coder-next
+        # all return clean output without the knob.
+        for non_thinking in [
+            'Llama-3.3-70B-Instruct',
+            'Llama-3.1-8B-Instruct',
+            'mistral-small-4-119b',
+            'mistral-small3.2',
+            'gpt-oss-120b',
+            'gpt-oss-20b',
+            'gemma4-31b',
+            'apertus-70b',
+            'qwen3-coder-next',
+        ]:
+            assert non_thinking not in _REGOLO_THINKING_MODELS
 
     def test_factory_strips_regolo_prefix_from_api_model(self):
         """The model name sent to api.regolo.ai must NOT include 'regolo/'."""
@@ -131,6 +168,26 @@ class TestRegoloFactory:
             clients._get_or_create_regolo_llm('regolo/qwen3.5-122b', streaming=False)
 
         assert captured['extra_body']['chat_template_kwargs']['enable_thinking'] is False
+
+    def test_thinking_knob_injected_for_qwen3_5_9b_and_qwen3_6_27b(self):
+        """qwen3.5-9b and qwen3.6-27b are also thinking models — live probe
+        without the knob hits max_tokens with no parseable output."""
+        from utils.llm import clients
+
+        for model in ['regolo/qwen3.5-9b', 'regolo/qwen3.6-27b']:
+            captured: dict[str, Any] = {}
+
+            class _FakeChatOpenAI:
+                def __init__(self, **kwargs):
+                    captured.update(kwargs)
+
+            with patch.object(clients, 'ChatOpenAI', _FakeChatOpenAI):
+                clients._llm_cache.clear()
+                clients._get_or_create_regolo_llm(model, streaming=False)
+
+            assert (
+                captured.get('extra_body', {}).get('chat_template_kwargs', {}).get('enable_thinking') is False
+            ), f'thinking knob missing for {model}'
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +328,41 @@ class TestEUPrivacyDispatcher:
         assert route.banner is not None
         # Banner must mention EU Privacy Mode so user knows why
         assert 'EU Privacy Mode' in route.banner
+
+    def test_knowledge_graph_extraction_routes_to_regolo_search_blocks(self):
+        """Subtle distinction: `knowledge_graph` is LLM extraction (supported)
+        vs `knowledge_graph_search` which is vector lookup (hard-blocked).
+        Easy to conflate; this test prevents regressions."""
+        from utils.llm import eu_privacy
+        from utils.llm.eu_privacy import FeatureRouteKind, resolve_feature_model
+
+        eu_privacy.set_eu_privacy_for_request(True)
+        # Extraction (LLM) — supported
+        route = resolve_feature_model('uid-1', 'knowledge_graph')
+        assert route.kind is FeatureRouteKind.REGOLO
+        # Search (embedding) — hard-blocked
+        eu_privacy._eu_privacy_ctx.set(True)
+        route = resolve_feature_model('uid-1', 'knowledge_graph_search')
+        assert route.kind is FeatureRouteKind.HARD_BLOCK
+
+    def test_every_supported_feature_has_a_model(self):
+        """Every entry in REGOLO_SUPPORTED_FEATURES must have a corresponding
+        model in _EU_FEATURE_MODELS, otherwise resolve_feature_model returns
+        a fallback that may not be the operator's intent."""
+        from utils.llm.eu_privacy import REGOLO_SUPPORTED_FEATURES, _EU_FEATURE_MODELS
+
+        missing = REGOLO_SUPPORTED_FEATURES - set(_EU_FEATURE_MODELS.keys())
+        assert not missing, f'features without explicit model picks: {sorted(missing)}'
+
+    def test_every_eu_model_uses_regolo_prefix(self):
+        """Sanity: every value in _EU_FEATURE_MODELS must classify as 'regolo'
+        per _classify_provider, otherwise the dispatcher would route to the
+        wrong factory."""
+        from utils.llm.clients import _classify_provider
+        from utils.llm.eu_privacy import _EU_FEATURE_MODELS
+
+        for feature, model in _EU_FEATURE_MODELS.items():
+            assert _classify_provider(model) == 'regolo', f'{feature}={model} does not classify as regolo'
 
     def test_eu_on_vision_hard_blocks(self):
         from utils.llm import eu_privacy
