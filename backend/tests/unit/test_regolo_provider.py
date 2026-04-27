@@ -1,0 +1,393 @@
+"""Behavioral tests for the Regolo provider wiring and EU Privacy Mode dispatcher.
+
+These tests use light mocking (no live API calls). The goal is to exercise
+the decision points that broke or surprised reviewers:
+- classifier ordering (regolo/ vs OpenRouter /)
+- BYOK fallback resolution
+- thinking-knob injection on the right models only
+- reasoning_content stripping
+- error taxonomy classification
+- EU Privacy Mode hard-block vs route-to-regolo vs primary
+- SSRF defense (base URL is constant)
+
+All tests can run without ENCRYPTION_SECRET — they only touch the LLM
+clients module, error helpers, and the dispatcher; nothing reaches the DB
+or encryption layer.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import types
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# Ensure tests/unit can import backend modules — mirrors other tests in this dir.
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+
+# ---------------------------------------------------------------------------
+# Classifier
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyProvider:
+    def test_regolo_prefix_routes_to_regolo(self):
+        from utils.llm.clients import _classify_provider
+
+        assert _classify_provider('regolo/Llama-3.3-70B-Instruct') == 'regolo'
+        assert _classify_provider('regolo/minimax-m2.5') == 'regolo'
+        assert _classify_provider('regolo/Qwen3-Embedding-8B') == 'regolo'
+
+    def test_openrouter_models_still_route_to_openrouter(self):
+        """The regolo/ check must come BEFORE the generic / check."""
+        from utils.llm.clients import _classify_provider
+
+        assert _classify_provider('google/gemini-3-flash-preview') == 'openrouter'
+        assert _classify_provider('anthropic/claude-3.5-sonnet') == 'openrouter'
+
+    def test_anthropic_perplexity_openai_unchanged(self):
+        from utils.llm.clients import _classify_provider
+
+        assert _classify_provider('claude-sonnet-4-6') == 'anthropic'
+        assert _classify_provider('sonar-pro') == 'perplexity'
+        assert _classify_provider('gpt-4.1-mini') == 'openai'
+
+
+# ---------------------------------------------------------------------------
+# Regolo factory + thinking-knob + SSRF defense
+# ---------------------------------------------------------------------------
+
+
+class TestRegoloFactory:
+    def test_base_url_is_constant(self):
+        """SSRF defense — base URL must NEVER be derived from input."""
+        from utils.llm.clients import _REGOLO_BASE_URL
+
+        assert _REGOLO_BASE_URL == 'https://api.regolo.ai/v1'
+        assert _REGOLO_BASE_URL.startswith('https://')
+
+    def test_thinking_models_set(self):
+        from utils.llm.clients import _REGOLO_THINKING_MODELS
+
+        assert 'minimax-m2.5' in _REGOLO_THINKING_MODELS
+        assert 'qwen3.5-122b' in _REGOLO_THINKING_MODELS
+        # Negative — Llama is NOT a thinking model
+        assert 'Llama-3.3-70B-Instruct' not in _REGOLO_THINKING_MODELS
+
+    def test_factory_strips_regolo_prefix_from_api_model(self):
+        """The model name sent to api.regolo.ai must NOT include 'regolo/'."""
+        from utils.llm import clients
+
+        # Patch ChatOpenAI ctor to capture kwargs
+        captured: dict[str, Any] = {}
+
+        class _FakeChatOpenAI:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        with patch.object(clients, 'ChatOpenAI', _FakeChatOpenAI):
+            # Bypass cache for this test — clear before invoking
+            clients._llm_cache.clear()
+            clients._get_or_create_regolo_llm('regolo/Llama-3.3-70B-Instruct', streaming=False)
+
+        assert captured.get('model') == 'Llama-3.3-70B-Instruct'
+        assert captured.get('base_url') == 'https://api.regolo.ai/v1'
+        # Llama is NOT a thinking model — extra_body must be absent.
+        assert 'extra_body' not in captured
+
+    def test_thinking_knob_injected_for_minimax(self):
+        from utils.llm import clients
+
+        captured: dict[str, Any] = {}
+
+        class _FakeChatOpenAI:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        with patch.object(clients, 'ChatOpenAI', _FakeChatOpenAI):
+            clients._llm_cache.clear()
+            clients._get_or_create_regolo_llm('regolo/minimax-m2.5', streaming=False)
+
+        extra = captured.get('extra_body')
+        assert extra == {'chat_template_kwargs': {'enable_thinking': False}}, extra
+
+    def test_thinking_knob_injected_for_qwen3_5_122b(self):
+        from utils.llm import clients
+
+        captured: dict[str, Any] = {}
+
+        class _FakeChatOpenAI:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        with patch.object(clients, 'ChatOpenAI', _FakeChatOpenAI):
+            clients._llm_cache.clear()
+            clients._get_or_create_regolo_llm('regolo/qwen3.5-122b', streaming=False)
+
+        assert captured['extra_body']['chat_template_kwargs']['enable_thinking'] is False
+
+
+# ---------------------------------------------------------------------------
+# reasoning_content stripper
+# ---------------------------------------------------------------------------
+
+
+class TestStripReasoningContent:
+    def test_strips_from_basemessage_additional_kwargs(self):
+        from utils.llm.clients import strip_reasoning_content
+
+        msg = MagicMock()
+        msg.additional_kwargs = {
+            'reasoning_content': 'thinking out loud...',
+            'tool_calls': [{'id': 'tc_1'}],
+        }
+        strip_reasoning_content(msg)
+        assert 'reasoning_content' not in msg.additional_kwargs
+        assert 'tool_calls' in msg.additional_kwargs  # untouched
+
+    def test_strips_from_top_level_dict(self):
+        from utils.llm.clients import strip_reasoning_content
+
+        chunk = {'reasoning_content': 'inner monologue', 'content': 'visible'}
+        strip_reasoning_content(chunk)
+        assert 'reasoning_content' not in chunk
+        assert chunk['content'] == 'visible'
+
+    def test_strips_from_streaming_delta_nested(self):
+        from utils.llm.clients import strip_reasoning_content
+
+        chunk = {'delta': {'reasoning_content': 'hidden', 'content': 'shown'}}
+        strip_reasoning_content(chunk)
+        assert 'reasoning_content' not in chunk['delta']
+        assert chunk['delta']['content'] == 'shown'
+
+    def test_none_is_safe(self):
+        from utils.llm.clients import strip_reasoning_content
+
+        # Should not raise
+        assert strip_reasoning_content(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Regolo error taxonomy
+# ---------------------------------------------------------------------------
+
+
+class TestRegoloErrors:
+    def test_401_maps_to_auth_error(self):
+        from utils.llm.regolo_errors import RegoloAuthError, classify_regolo_error
+
+        exc = MagicMock()
+        exc.status_code = 401
+        result = classify_regolo_error(exc)
+        assert isinstance(result, RegoloAuthError)
+        assert result.fallback_eligible is False
+
+    def test_403_maps_to_forbidden(self):
+        from utils.llm.regolo_errors import RegoloForbiddenError, classify_regolo_error
+
+        exc = MagicMock()
+        exc.status_code = 403
+        assert isinstance(classify_regolo_error(exc), RegoloForbiddenError)
+
+    def test_429_extracts_retry_after(self):
+        from utils.llm.regolo_errors import RegoloRateLimitError, classify_regolo_error
+
+        exc = MagicMock()
+        exc.status_code = 429
+        exc.response = MagicMock()
+        exc.response.headers = {'Retry-After': '12'}
+        result = classify_regolo_error(exc)
+        assert isinstance(result, RegoloRateLimitError)
+        assert result.retry_after_s == 12.0
+        assert result.fallback_eligible is True
+
+    def test_5xx_is_fallback_eligible(self):
+        from utils.llm.regolo_errors import RegoloServiceError, classify_regolo_error
+
+        exc = MagicMock()
+        exc.status_code = 503
+        result = classify_regolo_error(exc)
+        assert isinstance(result, RegoloServiceError)
+        assert result.fallback_eligible is True
+
+    def test_unknown_status_treated_as_service_error(self):
+        from utils.llm.regolo_errors import RegoloServiceError, classify_regolo_error
+
+        exc = MagicMock()
+        exc.status_code = None
+        exc.response = None
+        result = classify_regolo_error(exc)
+        # Default fallback so transient/unknown stays retryable.
+        assert isinstance(result, RegoloServiceError)
+
+
+# ---------------------------------------------------------------------------
+# EU Privacy Mode dispatcher
+# ---------------------------------------------------------------------------
+
+
+class TestEUPrivacyDispatcher:
+    def setup_method(self):
+        # Reset request-scoped contextvar between tests
+        from utils.llm import eu_privacy
+
+        eu_privacy._eu_privacy_ctx.set(None)
+
+    def test_eu_off_returns_primary_route(self):
+        from utils.llm import eu_privacy
+        from utils.llm.eu_privacy import FeatureRouteKind, resolve_feature_model
+
+        eu_privacy.set_eu_privacy_for_request(False)
+        with patch('utils.llm.eu_privacy.get_model', return_value='gpt-4.1-mini'):
+            route = resolve_feature_model('uid-1', 'chat_responses')
+        assert route.kind is FeatureRouteKind.PRIMARY
+        assert route.model == 'gpt-4.1-mini'
+        assert route.banner is None
+
+    def test_eu_on_supported_feature_routes_to_regolo(self):
+        from utils.llm import eu_privacy
+        from utils.llm.eu_privacy import FeatureRouteKind, resolve_feature_model
+
+        eu_privacy.set_eu_privacy_for_request(True)
+        route = resolve_feature_model('uid-1', 'chat_responses')
+        assert route.kind is FeatureRouteKind.REGOLO
+        assert route.model and route.model.startswith('regolo/')
+
+    def test_eu_on_embedding_feature_hard_blocks(self):
+        from utils.llm import eu_privacy
+        from utils.llm.eu_privacy import FeatureRouteKind, resolve_feature_model
+
+        eu_privacy.set_eu_privacy_for_request(True)
+        route = resolve_feature_model('uid-1', 'memory_search')
+        assert route.kind is FeatureRouteKind.HARD_BLOCK
+        assert route.model is None
+        assert route.banner is not None
+        # Banner must mention EU Privacy Mode so user knows why
+        assert 'EU Privacy Mode' in route.banner
+
+    def test_eu_on_vision_hard_blocks(self):
+        from utils.llm import eu_privacy
+        from utils.llm.eu_privacy import FeatureRouteKind, resolve_feature_model
+
+        eu_privacy.set_eu_privacy_for_request(True)
+        route = resolve_feature_model('uid-1', 'vision')
+        assert route.kind is FeatureRouteKind.HARD_BLOCK
+
+    def test_eu_on_chat_agent_hard_blocks(self):
+        """chat_agent is Anthropic-only and must NOT silently fall back."""
+        from utils.llm import eu_privacy
+        from utils.llm.eu_privacy import FeatureRouteKind, resolve_feature_model
+
+        eu_privacy.set_eu_privacy_for_request(True)
+        route = resolve_feature_model('uid-1', 'chat_agent')
+        assert route.kind is FeatureRouteKind.HARD_BLOCK
+
+    def test_eu_on_unknown_feature_hard_blocks_by_default(self):
+        """Defensive default: any feature we forgot to categorize must be blocked,
+        not silently routed to a non-EU provider."""
+        from utils.llm import eu_privacy
+        from utils.llm.eu_privacy import FeatureRouteKind, resolve_feature_model
+
+        eu_privacy.set_eu_privacy_for_request(True)
+        route = resolve_feature_model('uid-1', 'feature_we_forgot_to_add')
+        assert route.kind is FeatureRouteKind.HARD_BLOCK
+        assert 'not yet certified' in (route.banner or '')
+
+    def test_eu_flag_fails_closed_on_firestore_error(self):
+        """Privacy fail-safe: if Firestore is unreachable, default to ON.
+        An outage briefly blocking unsupported features is operationally
+        better than briefly leaking EU user data to non-EU providers."""
+        from utils.llm import eu_privacy
+
+        eu_privacy._eu_privacy_ctx.set(None)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('REGOLO_EU_FAIL_OPEN', None)
+            with patch('utils.llm.eu_privacy.users_db.get_eu_privacy_mode', side_effect=RuntimeError('fs down')):
+                assert eu_privacy.get_eu_privacy_for_request('uid-1') is True
+
+    def test_eu_flag_can_fail_open_via_env_flag(self):
+        """REGOLO_EU_FAIL_OPEN=1 lets operators trade strict residency for
+        availability when Firestore is unreachable."""
+        from utils.llm import eu_privacy
+
+        eu_privacy._eu_privacy_ctx.set(None)
+        with patch.dict(os.environ, {'REGOLO_EU_FAIL_OPEN': '1'}):
+            with patch('utils.llm.eu_privacy.users_db.get_eu_privacy_mode', side_effect=RuntimeError('fs down')):
+                assert eu_privacy.get_eu_privacy_for_request('uid-1') is False
+
+    def test_clear_eu_privacy_context_resets_ctx(self):
+        """Background tasks must clear inherited contextvars."""
+        from utils.llm import eu_privacy
+
+        eu_privacy.set_eu_privacy_for_request(True)
+        assert eu_privacy._eu_privacy_ctx.get() is True
+        eu_privacy.clear_eu_privacy_context()
+        assert eu_privacy._eu_privacy_ctx.get() is None
+
+
+# ---------------------------------------------------------------------------
+# Streaming tool-call fixture replay
+#
+# Skipped until the live fixture is captured (run
+# tests/fixtures/capture_regolo_tool_call_stream.sh with a real REGOLO_API_KEY).
+# Phase 1 acceptance gate 9: every captured delta must be parseable by
+# LangChain's native OpenAI accumulator. If this test fails after the fixture
+# is committed, write a custom accumulator in _RegoloChatProxy.
+# ---------------------------------------------------------------------------
+
+
+_FIXTURE_PATH = os.path.join(
+    os.path.dirname(__file__), '..', 'fixtures', 'regolo_tool_call_stream.json'
+)
+
+
+@pytest.mark.skipif(
+    not os.path.exists(_FIXTURE_PATH),
+    reason='Run capture_regolo_tool_call_stream.sh with REGOLO_API_KEY to enable.',
+)
+class TestRegoloStreamingToolCallReplay:
+    def test_every_delta_has_expected_shape(self):
+        """Each captured chunk must look like the OpenAI streaming shape so
+        LangChain's native accumulator handles it. Specifically: top-level
+        `choices[i].delta` with optional `content`/`tool_calls`."""
+        import json
+
+        with open(_FIXTURE_PATH) as f:
+            deltas = json.load(f)
+        assert deltas, 'fixture is empty'
+        for d in deltas:
+            choices = d.get('choices') or []
+            assert isinstance(choices, list)
+            for c in choices:
+                # Every chunk past the prologue must carry a delta dict.
+                if 'delta' in c:
+                    assert isinstance(c['delta'], dict)
+
+    def test_tool_call_arguments_concatenate_to_valid_json(self):
+        """The tool_calls.function.arguments deltas must concatenate into
+        valid JSON — that's what the accumulator relies on."""
+        import json
+
+        with open(_FIXTURE_PATH) as f:
+            deltas = json.load(f)
+        # Walk all chunks and accumulate per-tool-call argument strings.
+        per_index_args: dict[int, str] = {}
+        for d in deltas:
+            for c in d.get('choices') or []:
+                delta = c.get('delta') or {}
+                for tc in delta.get('tool_calls') or []:
+                    idx = tc.get('index', 0)
+                    args = (tc.get('function') or {}).get('arguments', '')
+                    per_index_args[idx] = per_index_args.get(idx, '') + args
+        assert per_index_args, 'fixture has no tool_call deltas — recapture with a tool-eligible prompt'
+        for idx, joined in per_index_args.items():
+            # Must be parseable JSON — otherwise our accumulator is broken
+            # OR Regolo emitted in a non-OpenAI shape that needs translation.
+            json.loads(joined)
