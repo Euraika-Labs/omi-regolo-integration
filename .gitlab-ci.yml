@@ -1,0 +1,38 @@
+# This repo is a patch package, NOT a runnable application.
+# It contains Omi-side files (Python + Swift + docs) intended to be applied
+# on top of a BasedHardware/omi checkout. There is no buildable target at
+# repo root — Auto DevOps's herokuish/buildpack detection cannot succeed
+# and is disabled by the existence of this file.
+#
+# What we DO run:
+#   - Python compileall on every .py file (catches syntax regressions
+#     without needing the full Omi venv).
+#   - JSON validity for fixtures.
+#   - bash -n for shell scripts.
+#   - GitLab SAST + Secret Detection (still meaningful for source files).
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+stages:
+  - validate
+  - test
+
+python-syntax:
+  stage: validate
+  image: python:3.11-slim
+  script:
+    - python -m compileall -q -f .
+
+json-validity:
+  stage: validate
+  image: python:3.11-slim
+  script:
+    - find . -path ./.git -prune -o -name '*.json' -print | while read f; do python -c "import json,sys; json.load(open('$f'))" && echo "OK: $f" || exit 1; done
+
+shell-syntax:
+  stage: validate
+  image: bash:5
+  script:
+    - find . -path ./.git -prune -o -name '*.sh' -print -exec bash -n {} \;
