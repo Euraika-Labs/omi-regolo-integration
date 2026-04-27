@@ -176,16 +176,14 @@ class _RegoloChatProxy:
         """Sync streaming wrapper — strips reasoning_content per chunk and
         classifies exceptions raised during iteration. Yields the same chunk
         objects langchain would yield, mutated in place. Telemetry tags
-        injected so streaming usage attributes to Regolo too."""
+        injected so streaming usage attributes to Regolo too.
+
+        `target.stream(...)` returns a generator and does not raise on
+        construction; HTTP errors only materialize during iteration.
+        """
         target = self._resolve()
         args, kwargs = _inject_regolo_telemetry(self._model, args, kwargs)
-        try:
-            iterator = target.stream(*args, **kwargs)
-        except RegoloError:
-            raise
-        except Exception as exc:
-            raise classify_regolo_error(exc) from exc
-
+        iterator = target.stream(*args, **kwargs)
         try:
             for chunk in iterator:
                 yield strip_reasoning_content(chunk)
@@ -198,13 +196,7 @@ class _RegoloChatProxy:
         """Async streaming wrapper — same contract as `stream` but async."""
         target = self._resolve()
         args, kwargs = _inject_regolo_telemetry(self._model, args, kwargs)
-        try:
-            iterator = target.astream(*args, **kwargs)
-        except RegoloError:
-            raise
-        except Exception as exc:
-            raise classify_regolo_error(exc) from exc
-
+        iterator = target.astream(*args, **kwargs)
         try:
             async for chunk in iterator:
                 yield strip_reasoning_content(chunk)
@@ -282,9 +274,19 @@ def _inject_regolo_telemetry(
 
     langchain's `Runnable.invoke(input, config=None, **kwargs)` accepts the
     config either as 2nd positional or `config=` kwarg. We merge into whichever
-    the caller used (or set kwarg if neither). Tags + metadata both get the
-    provider attribution so callbacks reading either channel can attribute
-    usage rows to Regolo.
+    the caller used (or set kwarg if neither). Both tags and metadata channels
+    carry the attribution so callbacks reading either can attribute usage rows
+    to Regolo.
+
+    Idempotency / merge rules:
+      - `provider=regolo` tag: appended only if not already present.
+      - `model=<name>` tag: appended only if no `model=` tag is already present
+        (so a caller's own `model=foo` isn't double-stamped).
+      - `metadata['regolo_provider']` and `metadata['regolo_model']`: always
+        set (these are M1-private keys; never collide with caller metadata).
+      - `metadata['provider']`: set via setdefault to preserve any caller-
+        supplied value. The tags channel + the `regolo_provider` key keep
+        attribution working even if a caller pre-sets `metadata['provider']`.
     """
     # Resolve current config (may be None, dict, or langchain's RunnableConfig
     # which is a TypedDict — both behave like dicts at runtime).
@@ -301,12 +303,16 @@ def _inject_regolo_telemetry(
     tags = list(new_config.get('tags') or [])
     if _REGOLO_PROVIDER_TAG not in tags:
         tags.append(_REGOLO_PROVIDER_TAG)
+    if not any(isinstance(t, str) and t.startswith('model=') for t in tags):
         tags.append(f'model={model}')
     new_config['tags'] = tags
 
     metadata = dict(new_config.get('metadata') or {})
+    # M1-private keys — always overwrite so the upstream callback gets a
+    # reliable Regolo signal even when caller metadata uses 'provider'.
+    metadata['regolo_provider'] = 'regolo'
+    metadata['regolo_model'] = model
     metadata.setdefault('provider', 'regolo')
-    metadata.setdefault('regolo_model', model)
     new_config['metadata'] = metadata
 
     if config_via_kwarg or len(args) < 2:
