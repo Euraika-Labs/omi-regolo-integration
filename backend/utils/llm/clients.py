@@ -149,7 +149,7 @@ class _RegoloChatProxy:
 
     def invoke(self, *args: Any, **kwargs: Any) -> Any:
         """Wrap ChatOpenAI.invoke with reasoning-content stripping, typed error
-        classification, and bounded retry on 429/5xx.
+        classification, bounded retry on 429/5xx, and provider=regolo telemetry.
 
         - On success: drops `reasoning_content` so MiniMax / Qwen3.x thinking
           output never leaks into chat history.
@@ -158,20 +158,27 @@ class _RegoloChatProxy:
         - On 5xx: retries once with exponential backoff.
         - On 401/403/404 / unrecognized: re-raises typed `RegoloError`
           subclass with the original exception preserved via `from`.
+        - Telemetry: injects `provider=regolo` + `model=<name>` tags into
+          the langchain `RunnableConfig` so the upstream `_usage_callback`
+          can attribute usage rows to Regolo.
         """
         target = self._resolve()
+        args, kwargs = _inject_regolo_telemetry(self._model, args, kwargs)
         return _regolo_invoke_with_retry(lambda: target.invoke(*args, **kwargs))
 
     async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
-        """Async equivalent of invoke — same strip / classify / retry contract."""
+        """Async equivalent of invoke — same strip / classify / retry / tag contract."""
         target = self._resolve()
+        args, kwargs = _inject_regolo_telemetry(self._model, args, kwargs)
         return await _regolo_ainvoke_with_retry(lambda: target.ainvoke(*args, **kwargs))
 
     def stream(self, *args: Any, **kwargs: Any):
         """Sync streaming wrapper — strips reasoning_content per chunk and
         classifies exceptions raised during iteration. Yields the same chunk
-        objects langchain would yield, mutated in place."""
+        objects langchain would yield, mutated in place. Telemetry tags
+        injected so streaming usage attributes to Regolo too."""
         target = self._resolve()
+        args, kwargs = _inject_regolo_telemetry(self._model, args, kwargs)
         try:
             iterator = target.stream(*args, **kwargs)
         except RegoloError:
@@ -190,6 +197,7 @@ class _RegoloChatProxy:
     async def astream(self, *args: Any, **kwargs: Any):
         """Async streaming wrapper — same contract as `stream` but async."""
         target = self._resolve()
+        args, kwargs = _inject_regolo_telemetry(self._model, args, kwargs)
         try:
             iterator = target.astream(*args, **kwargs)
         except RegoloError:
@@ -263,6 +271,49 @@ class _OpenAIEmbeddingsProxy:
 _REGOLO_MAX_RATE_LIMIT_ATTEMPTS = 3
 _REGOLO_RETRY_BASE_BACKOFF_S = 1.0
 _REGOLO_RETRY_MAX_BACKOFF_S = 30.0
+
+_REGOLO_PROVIDER_TAG = 'provider=regolo'
+
+
+def _inject_regolo_telemetry(
+    model: str, args: tuple, kwargs: Dict[str, Any]
+) -> tuple:
+    """Add `provider=regolo` + `model=<name>` to the langchain RunnableConfig.
+
+    langchain's `Runnable.invoke(input, config=None, **kwargs)` accepts the
+    config either as 2nd positional or `config=` kwarg. We merge into whichever
+    the caller used (or set kwarg if neither). Tags + metadata both get the
+    provider attribution so callbacks reading either channel can attribute
+    usage rows to Regolo.
+    """
+    # Resolve current config (may be None, dict, or langchain's RunnableConfig
+    # which is a TypedDict — both behave like dicts at runtime).
+    config_via_kwarg = 'config' in kwargs
+    if config_via_kwarg:
+        existing = kwargs.get('config') or {}
+    elif len(args) >= 2:
+        existing = args[1] or {}
+    else:
+        existing = {}
+
+    new_config = dict(existing)
+
+    tags = list(new_config.get('tags') or [])
+    if _REGOLO_PROVIDER_TAG not in tags:
+        tags.append(_REGOLO_PROVIDER_TAG)
+        tags.append(f'model={model}')
+    new_config['tags'] = tags
+
+    metadata = dict(new_config.get('metadata') or {})
+    metadata.setdefault('provider', 'regolo')
+    metadata.setdefault('regolo_model', model)
+    new_config['metadata'] = metadata
+
+    if config_via_kwarg or len(args) < 2:
+        kwargs['config'] = new_config
+        return args, kwargs
+    args = (args[0], new_config) + args[2:]
+    return args, kwargs
 
 
 def _regolo_backoff_seconds(attempt: int, retry_after_s: Optional[float]) -> float:
