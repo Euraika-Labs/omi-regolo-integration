@@ -1,6 +1,9 @@
+import asyncio
 import hashlib
 import logging
 import os
+import random
+import time
 from typing import Any, Dict, List, Optional
 
 import anthropic
@@ -12,7 +15,12 @@ import tiktoken
 
 from models.structured import Structured
 from utils.byok import get_byok_key
-from utils.llm.regolo_errors import RegoloError, classify_regolo_error
+from utils.llm.regolo_errors import (
+    RegoloError,
+    RegoloRateLimitError,
+    RegoloServiceError,
+    classify_regolo_error,
+)
 from utils.llm.usage_tracker import get_usage_callback
 
 logger = logging.getLogger(__name__)
@@ -140,34 +148,24 @@ class _RegoloChatProxy:
         return self._default
 
     def invoke(self, *args: Any, **kwargs: Any) -> Any:
-        """Wrap ChatOpenAI.invoke with reasoning-content stripping and Regolo
-        error classification.
+        """Wrap ChatOpenAI.invoke with reasoning-content stripping, typed error
+        classification, and bounded retry on 429/5xx.
 
-        - On success: drops `reasoning_content` from the assistant message so
-          MiniMax / Qwen3.x thinking output never leaks into chat history.
-        - On exception: re-raises a typed `RegoloError` subclass (auth, rate-
-          limit, model-not-found, service) so callers can branch on type
-          rather than parsing httpx error strings.
+        - On success: drops `reasoning_content` so MiniMax / Qwen3.x thinking
+          output never leaks into chat history.
+        - On 429: retries up to `_REGOLO_MAX_RATE_LIMIT_ATTEMPTS` times,
+          honoring `Retry-After` when present.
+        - On 5xx: retries once with exponential backoff.
+        - On 401/403/404 / unrecognized: re-raises typed `RegoloError`
+          subclass with the original exception preserved via `from`.
         """
         target = self._resolve()
-        try:
-            result = target.invoke(*args, **kwargs)
-        except RegoloError:
-            raise
-        except Exception as exc:
-            raise classify_regolo_error(exc) from exc
-        return strip_reasoning_content(result)
+        return _regolo_invoke_with_retry(lambda: target.invoke(*args, **kwargs))
 
     async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
-        """Async equivalent of invoke — same strip-on-success / classify-on-error contract."""
+        """Async equivalent of invoke — same strip / classify / retry contract."""
         target = self._resolve()
-        try:
-            result = await target.ainvoke(*args, **kwargs)
-        except RegoloError:
-            raise
-        except Exception as exc:
-            raise classify_regolo_error(exc) from exc
-        return strip_reasoning_content(result)
+        return await _regolo_ainvoke_with_retry(lambda: target.ainvoke(*args, **kwargs))
 
     def stream(self, *args: Any, **kwargs: Any):
         """Sync streaming wrapper — strips reasoning_content per chunk and
@@ -244,6 +242,91 @@ class _OpenAIEmbeddingsProxy:
 
     def __getattr__(self, name: str):
         return getattr(self._resolve(), name)
+
+
+# ---------------------------------------------------------------------------
+# Regolo retry policy (M1.3)
+#
+# Applied at the invoke / ainvoke hand-off in `_RegoloChatProxy`. NOT applied
+# to streaming wrappers — retrying mid-stream would resend the prompt and
+# duplicate any side effects callers have already observed from the partial
+# output.
+#
+# Policy:
+#   - 429 (RegoloRateLimitError): up to 3 total attempts (initial + 2 retries).
+#     Honors `Retry-After` when present, otherwise exponential backoff with
+#     10% jitter, capped at _REGOLO_RETRY_MAX_BACKOFF_S.
+#   - 5xx (RegoloServiceError): 1 retry with exponential backoff, then re-raise.
+#   - Everything else (auth / forbidden / model-not-found / unknown):
+#     re-raise immediately as the typed RegoloError subclass.
+# ---------------------------------------------------------------------------
+_REGOLO_MAX_RATE_LIMIT_ATTEMPTS = 3
+_REGOLO_RETRY_BASE_BACKOFF_S = 1.0
+_REGOLO_RETRY_MAX_BACKOFF_S = 30.0
+
+
+def _regolo_backoff_seconds(attempt: int, retry_after_s: Optional[float]) -> float:
+    """Wait seconds for a Regolo retry. `attempt` is 0-indexed."""
+    if retry_after_s is not None and retry_after_s > 0:
+        return min(retry_after_s, _REGOLO_RETRY_MAX_BACKOFF_S)
+    base = _REGOLO_RETRY_BASE_BACKOFF_S * (2**attempt)
+    jitter = random.uniform(0, base * 0.1)
+    return min(base + jitter, _REGOLO_RETRY_MAX_BACKOFF_S)
+
+
+def _next_regolo_retry_wait(
+    rate_limit_attempts: int, five_xx_retried: bool, classified: RegoloError
+) -> Optional[float]:
+    """Wait seconds, or None if the retry budget is exhausted / error is terminal."""
+    if isinstance(classified, RegoloRateLimitError):
+        if rate_limit_attempts >= _REGOLO_MAX_RATE_LIMIT_ATTEMPTS - 1:
+            return None
+        return _regolo_backoff_seconds(rate_limit_attempts, classified.retry_after_s)
+    if isinstance(classified, RegoloServiceError) and not five_xx_retried:
+        return _regolo_backoff_seconds(0, None)
+    return None
+
+
+def _regolo_invoke_with_retry(call: Any) -> Any:
+    """Sync retry loop. `call` is a 0-arg callable that returns the LLM result."""
+    rate_limit_attempts = 0
+    five_xx_retried = False
+    while True:
+        try:
+            return strip_reasoning_content(call())
+        except Exception as exc:
+            classified = exc if isinstance(exc, RegoloError) else classify_regolo_error(exc)
+            wait = _next_regolo_retry_wait(rate_limit_attempts, five_xx_retried, classified)
+            if wait is None:
+                if isinstance(exc, RegoloError):
+                    raise
+                raise classified from exc
+            if isinstance(classified, RegoloRateLimitError):
+                rate_limit_attempts += 1
+            elif isinstance(classified, RegoloServiceError):
+                five_xx_retried = True
+            time.sleep(wait)
+
+
+async def _regolo_ainvoke_with_retry(call: Any) -> Any:
+    """Async retry loop. `call` is a 0-arg callable returning an awaitable."""
+    rate_limit_attempts = 0
+    five_xx_retried = False
+    while True:
+        try:
+            return strip_reasoning_content(await call())
+        except Exception as exc:
+            classified = exc if isinstance(exc, RegoloError) else classify_regolo_error(exc)
+            wait = _next_regolo_retry_wait(rate_limit_attempts, five_xx_retried, classified)
+            if wait is None:
+                if isinstance(exc, RegoloError):
+                    raise
+                raise classified from exc
+            if isinstance(classified, RegoloRateLimitError):
+                rate_limit_attempts += 1
+            elif isinstance(classified, RegoloServiceError):
+                five_xx_retried = True
+            await asyncio.sleep(wait)
 
 
 _BYOK_CACHE_MAX_SIZE = 256
