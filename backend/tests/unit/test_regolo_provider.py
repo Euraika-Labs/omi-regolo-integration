@@ -656,6 +656,124 @@ class TestRegoloErrors:
 
 
 # ---------------------------------------------------------------------------
+# Regolo embedding proxy + EU index provisioning gate (M2.5)
+# ---------------------------------------------------------------------------
+
+
+class TestRegoloEmbeddingProxy:
+    def test_factory_constructs_with_regolo_base_url(self):
+        """The default embeddings client must point at api.regolo.ai/v1, not OpenAI."""
+        from utils.llm import clients
+
+        captured: dict[str, Any] = {}
+
+        class _FakeEmbeddings:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        with patch.object(clients, 'OpenAIEmbeddings', _FakeEmbeddings):
+            proxy = clients._RegoloEmbeddingProxy(
+                model='Qwen3-Embedding-8B',
+                default=_FakeEmbeddings(
+                    model='Qwen3-Embedding-8B',
+                    base_url='https://api.regolo.ai/v1',
+                ),
+                ctor_kwargs={},
+            )
+            # Force re-resolve via BYOK path so we can assert the kwargs.
+            with patch.object(clients, 'get_byok_key', return_value='byok-test'):
+                clients._openai_cache.clear()
+                proxy._resolve()
+
+        assert captured.get('model') == 'Qwen3-Embedding-8B'
+        assert captured.get('base_url') == 'https://api.regolo.ai/v1'
+        assert captured.get('api_key') == 'byok-test'
+
+    def test_module_level_regolo_embeddings_uses_4096_model(self):
+        from utils.llm.clients import (
+            _REGOLO_EMBEDDING_DIM,
+            _REGOLO_EMBEDDING_MODEL,
+            regolo_embeddings,
+        )
+
+        assert _REGOLO_EMBEDDING_MODEL == 'Qwen3-Embedding-8B'
+        assert _REGOLO_EMBEDDING_DIM == 4096
+        # Object slot equals the model name
+        assert regolo_embeddings._model == 'Qwen3-Embedding-8B'
+
+    def test_resolver_falls_back_to_default_when_no_byok(self):
+        from utils.llm import clients
+
+        sentinel = object()
+        proxy = clients._RegoloEmbeddingProxy(
+            model='Qwen3-Embedding-8B',
+            default=sentinel,  # type: ignore[arg-type]
+            ctor_kwargs={},
+        )
+        with patch.object(clients, 'get_byok_key', return_value=None):
+            assert proxy._resolve() is sentinel
+
+
+class TestEuEmbeddingIndexGate:
+    def setup_method(self):
+        self._original = os.environ.get('PINECONE_INDEX_NAME_EU')
+        os.environ.pop('PINECONE_INDEX_NAME_EU', None)
+
+    def teardown_method(self):
+        if self._original is None:
+            os.environ.pop('PINECONE_INDEX_NAME_EU', None)
+        else:
+            os.environ['PINECONE_INDEX_NAME_EU'] = self._original
+
+    def test_unset_returns_false(self):
+        from utils.llm.eu_privacy import eu_embedding_index_provisioned
+
+        assert eu_embedding_index_provisioned() is False
+
+    def test_empty_returns_false(self):
+        from utils.llm.eu_privacy import eu_embedding_index_provisioned
+
+        os.environ['PINECONE_INDEX_NAME_EU'] = '   '
+        assert eu_embedding_index_provisioned() is False
+
+    def test_non_empty_returns_true(self):
+        from utils.llm.eu_privacy import eu_embedding_index_provisioned
+
+        os.environ['PINECONE_INDEX_NAME_EU'] = 'omi-eu-prod-4096'
+        assert eu_embedding_index_provisioned() is True
+
+    def test_memory_search_hard_blocks_when_index_unset(self):
+        """EMBEDDING_DEPENDENT_FEATURES stay HARD_BLOCKED until the EU index is provisioned."""
+        from utils.llm.eu_privacy import (
+            FeatureRouteKind,
+            resolve_feature_model,
+            set_eu_privacy_for_request,
+        )
+
+        set_eu_privacy_for_request(True)
+        with patch('database.users.is_eu_privacy_mode_enabled', return_value=True):
+            route = resolve_feature_model('user-x', 'memory_search')
+
+        assert route.kind is FeatureRouteKind.HARD_BLOCK
+        assert route.banner is not None
+
+    def test_memory_search_routes_to_regolo_when_index_set(self):
+        from utils.llm.eu_privacy import (
+            FeatureRouteKind,
+            resolve_feature_model,
+            set_eu_privacy_for_request,
+        )
+
+        os.environ['PINECONE_INDEX_NAME_EU'] = 'omi-eu-prod-4096'
+        set_eu_privacy_for_request(True)
+        with patch('database.users.is_eu_privacy_mode_enabled', return_value=True):
+            route = resolve_feature_model('user-x', 'memory_search')
+
+        assert route.kind is FeatureRouteKind.REGOLO
+        assert route.model == 'regolo/Qwen3-Embedding-8B'
+
+
+# ---------------------------------------------------------------------------
 # EU Privacy Mode dispatcher
 # ---------------------------------------------------------------------------
 
