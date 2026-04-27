@@ -158,9 +158,60 @@ class _RegoloChatProxy:
             raise classify_regolo_error(exc) from exc
         return strip_reasoning_content(result)
 
+    async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
+        """Async equivalent of invoke — same strip-on-success / classify-on-error contract."""
+        target = self._resolve()
+        try:
+            result = await target.ainvoke(*args, **kwargs)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+        return strip_reasoning_content(result)
+
+    def stream(self, *args: Any, **kwargs: Any):
+        """Sync streaming wrapper — strips reasoning_content per chunk and
+        classifies exceptions raised during iteration. Yields the same chunk
+        objects langchain would yield, mutated in place."""
+        target = self._resolve()
+        try:
+            iterator = target.stream(*args, **kwargs)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+
+        try:
+            for chunk in iterator:
+                yield strip_reasoning_content(chunk)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+
+    async def astream(self, *args: Any, **kwargs: Any):
+        """Async streaming wrapper — same contract as `stream` but async."""
+        target = self._resolve()
+        try:
+            iterator = target.astream(*args, **kwargs)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+
+        try:
+            async for chunk in iterator:
+                yield strip_reasoning_content(chunk)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+
     def __getattr__(self, name: str) -> Any:
-        # Async (`ainvoke`) and streaming (`astream` / `stream`) paths still go
-        # through __getattr__ unwrapped — M1.2 follow-up wires those.
+        # Everything else (bind_tools, batch, abatch, with_structured_output,
+        # with_retry, ...) falls through to the underlying ChatOpenAI. The
+        # invoke/ainvoke/stream/astream paths above cover the four hand-offs
+        # that touch reasoning_content and Regolo error envelopes.
         return getattr(self._resolve(), name)
 
     def __or__(self, other: Any) -> Any:
