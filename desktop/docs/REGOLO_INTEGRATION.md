@@ -4,21 +4,41 @@
 
 Adds [regolo.ai](https://regolo.ai) as a third LLM provider path alongside the existing Anthropic (Claude) and Google (Gemini) paths. Regolo is an Italy-hosted, OpenAI-compatible inference platform with a stated zero-retention, GDPR-compliant posture — routing Omi's LLM traffic through it lets us offer an "EU Privacy Mode" in which chat, synthesis, tool-calling, and embedding workloads stay in European infrastructure.
 
-**Status (Apr 2026):** scoped, not yet implemented.
+**Status (Apr 2026):** scoped, scaffolding in progress.
 **Author:** synthesis from `/octo:research` + `/octo:define` (Claude + Codex + Gemini consensus).
+
+### Implementation progress
+
+| Commit | What | Status |
+|---|---|---|
+| `desktop: add .regolo case to BYOKProvider enum` | Swift enum + switches | ✅ merged on branch |
+| `desktop: validate regolo.ai BYOK key against /v1/models` | BYOKValidator ping | ✅ merged on branch |
+| `backend: register x-byok-regolo in BYOK_HEADERS` | Middleware header map | ✅ merged on branch |
+| `backend: add _RegoloOpenAIProxy` | BYOK-gated proxy class | ✅ merged on branch |
+| `backend: unit tests for _RegoloOpenAIProxy` | 5 unit tests | ✅ merged on branch |
+| Swift APIClient header forwarding | `X-BYOK-Regolo` | ⏳ pending |
+| Settings UX (EU Privacy Mode toggle + banner) | `SettingsPrivacyView.swift` | ⏳ pending |
+| `ModelQoS.swift` regolo model IDs | Desktop model map | ⏳ pending |
+| Privacy QoS profile in `backend/utils/llm/clients.py` | feature → regolo model mapping | ⏳ pending |
+| Dispatcher integration (per-workload override based on privacy flag) | routing logic | ⏳ pending |
+| Integration tests for dispatcher decision table | 9-row table | ⏳ pending |
+| Register `test_regolo_client.py` in `backend/test.sh` | CI wiring | ⏳ pending |
 
 ## Research context
 
-Regolo.ai exposes OpenAI-compatible endpoints at `https://api.regolo.ai/v1` and hosts ~19 open-source models. Live probes against the production API confirmed:
+Regolo.ai exposes OpenAI-compatible endpoints at `https://api.regolo.ai/v1` and hosts 20 open-source models on PAYG (Apr 2026 catalog). The full `/v1/models` listing and the empirical multi-sample latency/consistency data behind every model pick below are in [`regolo-probes.md`](./regolo-probes.md). Headline findings:
 
 | Capability | Model | Result |
 |---|---|---|
-| Auth + models list | `GET /v1/models` | ✓ |
-| Tool calling | `Llama-3.3-70B-Instruct` | ✓ clean OpenAI-compat `tool_calls`, bonus `reasoning_content` field |
+| Auth + models list | `GET /v1/models` | ✓ — 20 models on PAYG |
+| Tool calling | `Llama-3.3-70B-Instruct` (default), uniform across all probed mid/large chat models | ✓ clean OpenAI-compat `tool_calls` |
+| Streaming tool-call deltas | `Llama-3.3-70B-Instruct` | ✓ OpenAI-standard SSE — `langchain_openai.ChatOpenAI` accumulates natively (fixture in sister repo: `/opt/projects/omi-regolo-integration/backend/tests/fixtures/regolo_tool_call_stream.json`; M1 task to port into this branch) |
 | Embeddings | `Qwen3-Embedding-8B` | ✓ 4096-dim |
-| Chat (thinking model) | `minimax-m2.5` | ✓ **requires** `chat_template_kwargs:{enable_thinking:false}`; else `content:null, finish_reason:length` |
-| Structured JSON extraction | `qwen3.5-122b` | ✓ same thinking caveat; clean JSON with thinking off |
-| Vision | `qwen3-vl-32b` | ⚠️ listed in some tiers only — availability uncertain on PAYG |
+| Chat — thinking-model knob | `qwen3.5-9b/122b`, `qwen3.6-27b`, `minimax-m2.5` | **require** `chat_template_kwargs:{enable_thinking:false}`; else `content:null, finish_reason:length`. **No-op** on Llama / Mistral / gpt-oss / gemma / apertus families. |
+| `reasoning_content` leakage | `minimax-m2.5` only | always emitted — `strip_reasoning_content()` mandatory before persistence |
+| Structured JSON extraction | every probed chat model | ✓ clean JSON via prompt-engineered output; `response_format:json_object` strict mode untested (P9) |
+| Latency × consistency winner | `mistral-small-4-119b` (n=5, p50 0.43s, p90 0.44s, ±2%) | beats Llama-3.3-70B (0.83s) and qwen3.5-122b (bimodal, p90 2.25s); minimax-m2.5 timed out 3/5 calls |
+| Vision | `qwen3-vl-32b` | ✗ **HARD-BLOCKED** — not in PAYG `/v1/models`. Vision falls back to Gemini with red banner. |
 
 **Pricing (Apr 2026):** per 1M tokens input/output — `minimax-m2.5` €0.60/€3.80, `Llama-3.3-70B-Instruct` €0.60/€2.70, `qwen3.5-122b` €1.00/€4.20, `qwen3.5-9b` €0.07/€0.35. Roughly 15–25 % of Claude Sonnet's rate for equivalent workloads.
 
@@ -38,13 +58,23 @@ One settings-level toggle flips chat + synthesis + tool-call + embedding workloa
 
 When Privacy Mode is on and a request cannot be served by regolo (vision unsupported, 5xx outage, persistent 429), the request falls back to the primary provider **with a visible banner** (`⚠️ This request left the EU — vision unsupported / outage`). This is a deliberate design choice: strict airlock behavior would disable too many features silently. Users who want hard airlock can disable the affected feature manually.
 
-### Thin custom adapter, not LiteLLM
+### Thin transparent proxy, not LiteLLM
 
-Regolo needs provider-specific request shaping (`chat_template_kwargs.enable_thinking`, `reasoning_content` stripping, streaming tool-delta accumulator). LiteLLM would smooth these away. A ~200-LOC `regolo_client.py` next to the existing `claude_client.py` and `gemini_client.py` preserves the feature control.
+Regolo needs provider-specific request shaping — most importantly `chat_template_kwargs.enable_thinking=false` injected via `extra_body` to disable OSS-model internal reasoning. LiteLLM would smooth that away. Omi's backend already ships with a "transparent proxy" pattern in `utils/llm/clients.py` (see `_OpenRouterGeminiProxy`, `_AnthropicViaOpenAIProxy`) that wraps a default `ChatOpenAI` and swaps in a BYOK-keyed client when the header is present. The regolo integration slots in as **`_RegoloOpenAIProxy`**, following the exact same pattern — no new adapter framework, no LiteLLM dependency.
 
-### Streaming tool calls
+### Streaming tool calls — no custom accumulator needed
 
-Day 1 ships with full streaming including tool_calls delta accumulation. The accumulator holds partial `tool_calls[i].function.arguments` chunks until `finish_reason` fires. Live probe to confirm regolo's exact delta shape is the first Phase 1 dev task.
+Live probe against `api.regolo.ai/v1/chat/completions` with `stream=true` confirmed that regolo emits standard OpenAI-compat SSE chunks. `langchain_openai.ChatOpenAI` handles the tool-call delta accumulation natively — no custom accumulator required. Sample shape:
+
+```
+data: {"choices":[{"delta":{"tool_calls":[{"id":"tc_1","index":0,"function":{"arguments":"","name":"get_weather"},"type":"function"}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\": \""}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Paris\"}"}}]}}]}
+data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}
+data: [DONE]
+```
+
+This simplifies the backend adapter significantly — the `regolo_client.py` file planned in the original spec is not needed as a separate module.
 
 ## Request flow
 
@@ -107,16 +137,16 @@ graph LR
     end
 
     subgraph "Backend (Python FastAPI)"
-        Router[routers/chat.py<br/>synthesis.py<br/>embeddings.py]
-        Dispatcher[utils/llms/dispatcher.py<br/>NEW: pick provider by<br/>workload + privacy_mode]
-        ClaudeC[utils/llms/claude_client.py<br/>existing]
-        GeminiC[utils/llms/gemini_client.py<br/>existing]
-        RegoloC[utils/llms/regolo_client.py<br/>NEW: OpenAI-compat<br/>+ chat_template_kwargs<br/>+ reasoning_content stripper<br/>+ streaming delta accumulator]
+        Router[routers/chat.py<br/>conversations.py<br/>retrieval/*]
+        Clients[utils/llm/clients.py<br/>MODIFIED: add<br/>_RegoloOpenAIProxy<br/>+ privacy QoS profile]
+        ClaudeC[anthropic_client<br/>existing proxy]
+        GeminiC[_OpenRouterGeminiProxy<br/>existing]
+        RegoloC[_RegoloOpenAIProxy<br/>NEW: base_url swap<br/>+ enable_thinking:false<br/>via extra_body]
 
-        Router --> Dispatcher
-        Dispatcher --> ClaudeC
-        Dispatcher --> GeminiC
-        Dispatcher --> RegoloC
+        Router --> Clients
+        Clients --> ClaudeC
+        Clients --> GeminiC
+        Clients --> RegoloC
     end
 
     subgraph "External"
@@ -136,10 +166,11 @@ graph LR
 | Privacy Mode | Workload | Regolo supports? | Route → | Banner? |
 |---|---|---|---|---|
 | OFF | any | — | existing Claude/Gemini | no |
-| ON | chat | ✓ | `regolo: minimax-m2.5` | no |
-| ON | synthesis | ✓ | `regolo: Llama-3.3-70B-Instruct` | no |
+| ON | chat | ✓ | `regolo: mistral-small-4-119b` (was `minimax-m2.5` in the original spec — replaced after P6 latency probe found 3/5 calls timed out at 60s) | no |
+| ON | synthesis | ✓ | `regolo: mistral-small-4-119b` (default) or `Llama-3.3-70B-Instruct` (where Llama's longer instruction-following helps) | no |
 | ON | tool_call | ✓ | `regolo: Llama-3.3-70B-Instruct` | no |
-| ON | ChatLab grade | ✓ | `regolo: qwen3.5-9b` | no |
+| ON | nano-tier classification | ✓ | `regolo: Llama-3.1-8B-Instruct` (€0.05/€0.25 per 1M, 0.62s p50) | no |
+| ON | ChatLab grade | ✓ (operator override only — bimodal latency) | `regolo: qwen3.5-9b` via `MODEL_QOS_*` env var | no |
 | ON | embedding | ✓ | `regolo: Qwen3-Embedding-8B` | no |
 | ON | vision | ✗ (no qwen3-vl on PAYG) | `gemini: gemini-3-flash-preview` | ⚠️ left EU |
 | ON | regolo 5xx (after 1 retry) | temp no | fall back to Claude/Gemini | ⚠️ outage, left EU |
@@ -147,10 +178,12 @@ graph LR
 
 ## Streaming tool-call sequence
 
+Regolo emits standard OpenAI-compat SSE chunks; `langchain_openai.ChatOpenAI` handles accumulation natively. The backend's role is limited to forwarding the stream.
+
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant B as Backend<br/>regolo_client.py
+    participant B as Backend<br/>_RegoloOpenAIProxy via<br/>ChatOpenAI
     participant R as regolo.ai
 
     C->>B: POST /v1/chat (stream=true, tools=[...])
@@ -158,12 +191,10 @@ sequenceDiagram
     R-->>B: delta: {content:"Let me check "}
     B-->>C: delta: text
     R-->>B: delta: {tool_calls:[{index:0, id:"tc_1", function:{name:"get_weather"}}]}
-    B->>B: open tool accumulator[0]
     R-->>B: delta: {tool_calls:[{index:0, function:{arguments:"{\"city\":\""}}]}
-    B->>B: append partial args
     R-->>B: delta: {tool_calls:[{index:0, function:{arguments:"Paris\"}"}}]}
-    B->>B: args complete, JSON.parse
     R-->>B: finish_reason:tool_calls
+    Note over B: langchain's native<br/>tool-call parser<br/>assembles the deltas
     B-->>C: full tool_call event
 ```
 
@@ -174,8 +205,8 @@ sequenceDiagram
 | F1 | Add `.regolo` case to `BYOKProvider` in `APIKeyService.swift` with `X-BYOK-Regolo` header + `dev_regolo_api_key` storage key |
 | F2 | Extend `BYOKValidator.swift` to ping `GET https://api.regolo.ai/v1/models` with `Authorization: Bearer <key>` |
 | F3 | Backend accepts `X-BYOK-Regolo` and routes via `OSSProvider` client (`base_url=https://api.regolo.ai/v1`) |
-| F4 | Day-1 model map: `chat → minimax-m2.5`, `synthesis → Llama-3.3-70B-Instruct`, `chatLabGrade → qwen3.5-9b`, `embedding → Qwen3-Embedding-8B` |
-| F5 | All non-reasoning calls inject `chat_template_kwargs:{"enable_thinking":false}` |
+| F4 | Day-1 model map (post-P6 corrections): `chat → mistral-small-4-119b`, `synthesis → mistral-small-4-119b`, `tool_call → Llama-3.3-70B-Instruct`, `nano → Llama-3.1-8B-Instruct`, `embedding → Qwen3-Embedding-8B` (Phase 2). Thinking models (Qwen3.5-9b/122b, Qwen3.6-27b, MiniMax-m2.5) remain reachable via operator override (`MODEL_QOS_<FEATURE>=regolo/...`). |
+| F5 | Inject `chat_template_kwargs:{"enable_thinking":false}` via the `REGOLO_DISABLE_THINKING_EXTRA_BODY` constant (`backend/utils/llm/clients.py`) so OSS thinking models (MiniMax M2.5, Qwen3.x) don't return `content:null, finish_reason:length`. M1 follow-up: gate the injection on a `_REGOLO_THINKING_MODELS` set so the no-op flag isn't sent to Llama / Mistral / gpt-oss / gemma / apertus. |
 | F6 | Tool-call responses normalize to the existing internal shape; `reasoning_content` stripped before persistence |
 | F7 | Embedding responses normalize to the existing interface (4096-dim) |
 | F8 | Existing Claude/Gemini/OpenAI/Deepgram BYOK paths unchanged — zero regressions |
@@ -229,8 +260,8 @@ sequenceDiagram
 ## Acceptance criteria (QA-observable)
 
 1. Desktop settings shows regolo provider row with key field, "Test connection" button, and test result (✓ / ✗ with error reason).
-2. Flipping "EU Privacy Mode" on routes chat messages to `minimax-m2.5` — verified by telemetry showing `provider=regolo, model=minimax-m2.5`.
-3. Synthesis workload (e.g. Gmail summary) produces valid JSON output using `Llama-3.3-70B-Instruct`.
+2. Flipping "EU Privacy Mode" on routes chat messages to `mistral-small-4-119b` — verified by telemetry showing `provider=regolo, model=mistral-small-4-119b`.
+3. Synthesis workload (e.g. Gmail summary) produces valid JSON output using `mistral-small-4-119b` (default) or `Llama-3.3-70B-Instruct` (operator override).
 4. Tool-call flow ("create a reminder for tomorrow at 3pm") triggers `tools` with `tool_choice:auto`, receives a valid `tool_calls` response, and executes the reminder.
 5. Memory embedding + retrieval works end-to-end with `Qwen3-Embedding-8B` (4096-dim).
 6. With Privacy Mode ON, network capture confirms zero traffic to `anthropic.com` / `googleapis.com` / `openai.com` **except** for explicit fallback cases which emit the banner.
@@ -243,33 +274,44 @@ sequenceDiagram
 
 | # | Question | Status |
 |---|---|---|
-| 1 | Regolo tools schema matches OpenAI strict? | ✓ Resolved via live probe — Llama-3.3 returns standard `tool_calls`. |
-| 2 | Is `qwen3-vl-32b` production-available? | ⚠️ Open — missing from PAYG `/v1/models`. Need regolo support ticket / plan-tier confirmation. Day 1 ships without vision on regolo. |
-| 3 | Vision endpoint shape | Deferred to Phase 2. |
-| 4 | Embedding dimensionality | ✓ 4096 (live probe). DB schema must support variable `embedding_dim`. |
-| 5 | Is `enable_thinking` in body or header? | ✓ Body, under `chat_template_kwargs.enable_thinking`. |
+| 1 | Regolo tools schema matches OpenAI strict? | ✓ Resolved (P3) — uniform OpenAI-compat across Llama 8B/70B, Mistral 3.2/119B, gpt-oss-120B, qwen3.5-122b, minimax-m2.5. |
+| 2 | Is `qwen3-vl-32b` production-available? | ✗ **No on PAYG (P8).** HARD-BLOCKED in Phase 1. Vision falls back to Gemini with banner. To unblock: support ticket or plan upgrade. |
+| 3 | Vision endpoint shape | Deferred to Phase 2; not on Phase-1 critical path. |
+| 4 | Embedding dimensionality | ✓ Resolved (P7) — Qwen3-Embedding-8B is 4096-dim. Vector store keyed `(provider, model, dim)`. See `EMBEDDING_MIGRATION.md`. |
+| 5 | Is `enable_thinking` in body or header? | ✓ Resolved (P4) — body, under `chat_template_kwargs.enable_thinking`. **Per-model**: only the Qwen3.x family + MiniMax-m2.5 require it; this branch carries `REGOLO_DISABLE_THINKING_EXTRA_BODY` (`backend/utils/llm/clients.py:160`). M1 ports the per-model gating set from the sister repo. The unrelated top-level `"thinking":true,"reasoning_effort":...` opt-in (Regolo docs, `gpt-oss-120b`) is not used in Phase 1 (P10). |
 | 6 | Privacy Mode forces or defaults? | ✓ **Forces** all supported workloads; per-workload overrides disabled while on. |
 | 7 | Fallback allowed while Privacy Mode on? | ✓ **Yes, with visible red banner** per request. Preferred-by-default, not airlocked. |
-| 8 | Rate-limit tuning vs plan tier | Open — instrument telemetry in Phase 1; revisit plan choice with real usage data. |
-| 9 | Streaming parity for tool-call deltas | Open — first Phase 1 dev task is a live probe of regolo's streaming delta shape. |
+| 8 | Rate-limit tuning vs plan tier | Deferred (P11) — instrument telemetry in M1; revisit plan choice with real usage data in M5. |
+| 9 | Streaming parity for tool-call deltas | ✓ Resolved (P2) — OpenAI-standard SSE. Fixture in sister repo `/opt/projects/omi-regolo-integration/backend/tests/fixtures/regolo_tool_call_stream.json`; M1 ports it into this branch. `langchain_openai.ChatOpenAI` accumulates natively; no custom accumulator needed. |
 
-## Files touched (estimated)
+## Files touched (revised estimate after scaffolding)
 
-| File | Change | LOC |
-|---|---|---|
-| `desktop/Desktop/Sources/APIKeyService.swift` | `.regolo` case + storage/header/display | ~20 |
-| `desktop/Desktop/Sources/BYOKValidator.swift` | regolo ping | ~10 |
-| `desktop/Desktop/Sources/APIClient.swift` | `X-BYOK-Regolo` header | ~5 |
-| `desktop/Desktop/Sources/ModelQoS.swift` | regolo model IDs | ~15 |
-| `desktop/Desktop/Sources/SettingsPrivacyView.swift` (NEW) | toggle + banner surface | ~80 |
-| `backend/utils/llms/regolo_client.py` (NEW) | OpenAI-compat client + accumulator + stripper | ~200 |
-| `backend/utils/llms/dispatcher.py` (NEW) | workload + privacy_mode → provider | ~80 |
-| `backend/routers/{chat,synthesis,embeddings}.py` | dispatcher integration | ~40 |
-| `backend/tests/unit/test_regolo_client.py` (NEW) | normalization, streaming, error mapping | ~150 |
-| `backend/tests/integration/test_dispatcher.py` (NEW) | Privacy Mode routing | ~100 |
-| **Total new** | | **~700 LOC** |
+The original ~700 LOC estimate assumed a new `regolo_client.py` module + bespoke streaming accumulator + dispatcher. Live probing and code exploration revealed:
 
-Budget: **3–4 days** (1 backend, 1 desktop, 1 tests + polish, 1 integration / buffer).
+1. Regolo's streaming SSE is OpenAI-compat — langchain handles it natively (no accumulator)
+2. Omi's backend already has a transparent-proxy pattern for BYOK routing (`_AnthropicViaOpenAIProxy`, `_OpenRouterGeminiProxy`)
+3. Model routing lives in a profile-based `MODEL_QOS_PROFILES` dict — regolo slots in as a new profile
+
+Revised scope:
+
+| File | Change | LOC | Status |
+|---|---|---|---|
+| `desktop/Desktop/Sources/APIKeyService.swift` | `.regolo` case + storage/header/display | +4 | ✅ |
+| `desktop/Desktop/Sources/BYOKValidator.swift` | regolo ping | +5 | ✅ |
+| `desktop/Desktop/Sources/APIClient.swift` | `X-BYOK-Regolo` header forwarding | ~5 | ⏳ |
+| `desktop/Desktop/Sources/ModelQoS.swift` | regolo model IDs | ~15 | ⏳ |
+| `desktop/Desktop/Sources/SettingsPrivacyView.swift` (NEW) | toggle + banner surface | ~80 | ⏳ |
+| `backend/utils/byok.py` | `x-byok-regolo` header registration | +1 | ✅ |
+| `backend/utils/llm/clients.py` | `_RegoloOpenAIProxy` class + constants | +56 | ✅ (scaffolded) |
+| `backend/utils/llm/clients.py` | `privacy` QoS profile + feature dispatch | ~60 | ⏳ |
+| `backend/tests/unit/test_regolo_client.py` (NEW) | proxy routing tests | +168 | ✅ |
+| `backend/tests/integration/test_privacy_mode.py` (NEW) | decision-table tests | ~100 | ⏳ |
+| `backend/test.sh` | register new test file | +1 | ⏳ |
+| **Total shipped so far** | | **~234** | |
+| **Total remaining** | | **~260** | |
+| **Revised total** | | **~500 LOC** | |
+
+Budget: **2–3 days** remaining (1 backend dispatch + Swift UX, 1 tests, 0.5 buffer).
 
 ## References
 
