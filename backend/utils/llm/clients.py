@@ -12,6 +12,7 @@ import tiktoken
 
 from models.structured import Structured
 from utils.byok import get_byok_key
+from utils.llm.regolo_errors import RegoloError, classify_regolo_error
 from utils.llm.usage_tracker import get_usage_callback
 
 logger = logging.getLogger(__name__)
@@ -138,13 +139,34 @@ class _RegoloChatProxy:
             return _cached_openai_chat(self._model, byok, self._ctor_kwargs)
         return self._default
 
-    def __getattr__(self, name: str):
+    def invoke(self, *args: Any, **kwargs: Any) -> Any:
+        """Wrap ChatOpenAI.invoke with reasoning-content stripping and Regolo
+        error classification.
+
+        - On success: drops `reasoning_content` from the assistant message so
+          MiniMax / Qwen3.x thinking output never leaks into chat history.
+        - On exception: re-raises a typed `RegoloError` subclass (auth, rate-
+          limit, model-not-found, service) so callers can branch on type
+          rather than parsing httpx error strings.
+        """
+        target = self._resolve()
+        try:
+            result = target.invoke(*args, **kwargs)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+        return strip_reasoning_content(result)
+
+    def __getattr__(self, name: str) -> Any:
+        # Async (`ainvoke`) and streaming (`astream` / `stream`) paths still go
+        # through __getattr__ unwrapped — M1.2 follow-up wires those.
         return getattr(self._resolve(), name)
 
-    def __or__(self, other):
+    def __or__(self, other: Any) -> Any:
         return self._resolve() | other
 
-    def __ror__(self, other):
+    def __ror__(self, other: Any) -> Any:
         return other | self._resolve()
 
 
