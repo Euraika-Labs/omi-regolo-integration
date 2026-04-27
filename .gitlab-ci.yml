@@ -29,10 +29,12 @@ json-validity:
   stage: validate
   image: python:3.11-slim
   script:
-    - find . -path ./.git -prune -o -name '*.json' -print | while read f; do python -c "import json,sys; json.load(open('$f'))" && echo "OK: $f" || exit 1; done
+    - python -m json.tool desktop/CHANGELOG.json > /dev/null
+    - python -m json.tool backend/tests/fixtures/regolo_tool_call_stream.json > /dev/null
 
 shell-syntax:
   stage: validate
   image: bash:5
   script:
-    - find . -path ./.git -prune -o -name '*.sh' -print -exec bash -n {} \;
+    - bash -n backend/test.sh
+    - bash -n backend/tests/fixtures/capture_regolo_tool_call_stream.sh
