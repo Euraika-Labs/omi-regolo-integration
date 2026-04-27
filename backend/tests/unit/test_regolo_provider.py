@@ -307,6 +307,110 @@ class TestRegoloProxyInvoke:
 
 
 # ---------------------------------------------------------------------------
+# _RegoloChatProxy async + streaming hand-off (M1.2)
+#
+# Async tests use `asyncio.run` to drive coroutines synchronously — same
+# pattern as test_byok_security.py:1025+. No pytest-asyncio dependency.
+# ---------------------------------------------------------------------------
+
+
+class TestRegoloProxyAsyncAndStreaming:
+    def _make_proxy(self, fake_chat_openai: Any):
+        from utils.llm.clients import _RegoloChatProxy
+
+        return _RegoloChatProxy(model='Llama-3.3-70B-Instruct', default=fake_chat_openai, ctor_kwargs={})
+
+    def test_ainvoke_strips_reasoning_content_on_success(self):
+        import asyncio
+
+        msg = MagicMock()
+        msg.additional_kwargs = {'reasoning_content': 'inner', 'tool_calls': []}
+
+        async def _ainvoke(*a: Any, **kw: Any):
+            return msg
+
+        fake = MagicMock()
+        fake.ainvoke = _ainvoke
+
+        proxy = self._make_proxy(fake)
+        result = asyncio.run(proxy.ainvoke('hi'))
+
+        assert result is msg
+        assert 'reasoning_content' not in msg.additional_kwargs
+
+    def test_ainvoke_classifies_429_with_retry_after(self):
+        import asyncio
+        from utils.llm.regolo_errors import RegoloRateLimitError
+
+        exc = MagicMock(spec=Exception)
+        exc.status_code = 429
+        exc.response = MagicMock()
+        exc.response.headers = {'Retry-After': '7'}
+
+        async def _ainvoke(*a: Any, **kw: Any):
+            raise exc
+
+        fake = MagicMock()
+        fake.ainvoke = _ainvoke
+
+        proxy = self._make_proxy(fake)
+        with pytest.raises(RegoloRateLimitError) as info:
+            asyncio.run(proxy.ainvoke('hi'))
+        assert info.value.retry_after_s == 7.0
+
+    def test_astream_strips_reasoning_content_per_chunk(self):
+        import asyncio
+
+        chunks = [
+            {'delta': {'reasoning_content': 'thought-1', 'content': 'a'}},
+            {'delta': {'reasoning_content': 'thought-2', 'content': 'b'}},
+            {'delta': {'content': 'c'}},
+        ]
+
+        async def _agen(*a: Any, **kw: Any):
+            for c in chunks:
+                yield c
+
+        fake = MagicMock()
+        fake.astream = _agen
+
+        proxy = self._make_proxy(fake)
+
+        async def _drain():
+            return [c async for c in proxy.astream('hi')]
+
+        out = asyncio.run(_drain())
+        assert len(out) == 3
+        # All reasoning_content removed, content preserved.
+        for c in out:
+            assert 'reasoning_content' not in c['delta']
+        assert [c['delta']['content'] for c in out] == ['a', 'b', 'c']
+
+    def test_stream_classifies_5xx_during_iteration(self):
+        from utils.llm.regolo_errors import RegoloServiceError
+
+        exc = Exception('mid-stream boom')
+        exc.status_code = 502  # type: ignore[attr-defined]
+
+        def _sgen(*a: Any, **kw: Any):
+            yield {'delta': {'content': 'first'}}
+            raise exc
+
+        fake = MagicMock()
+        fake.stream = _sgen
+
+        proxy = self._make_proxy(fake)
+        consumed: list[Any] = []
+        with pytest.raises(RegoloServiceError):
+            for chunk in proxy.stream('hi'):
+                consumed.append(chunk)
+
+        # First chunk delivered before the failure.
+        assert len(consumed) == 1
+        assert consumed[0]['delta']['content'] == 'first'
+
+
+# ---------------------------------------------------------------------------
 # Regolo error taxonomy
 # ---------------------------------------------------------------------------
 
