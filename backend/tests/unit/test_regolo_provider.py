@@ -504,6 +504,68 @@ class TestRegoloProxyRetryPolicy:
 
 
 # ---------------------------------------------------------------------------
+# _RegoloChatProxy telemetry tagging (M1.4)
+#
+# The proxy injects `provider=regolo` + `model=<name>` into the langchain
+# RunnableConfig (both `tags` and `metadata` channels) so the upstream
+# `_usage_callback` can attribute usage rows to Regolo. User-supplied tags
+# / metadata must be preserved.
+# ---------------------------------------------------------------------------
+
+
+class TestRegoloProxyTelemetryTags:
+    def _make_proxy(self, fake_chat_openai: Any, model: str = 'mistral-small-4-119b'):
+        from utils.llm.clients import _RegoloChatProxy
+
+        return _RegoloChatProxy(model=model, default=fake_chat_openai, ctor_kwargs={})
+
+    def test_invoke_injects_provider_tag_when_no_user_config(self):
+        success_msg = MagicMock()
+        success_msg.additional_kwargs = {}
+        fake = MagicMock()
+        fake.invoke.return_value = success_msg
+
+        proxy = self._make_proxy(fake, model='Llama-3.3-70B-Instruct')
+        proxy.invoke('hi')
+
+        # Inspect the config the proxy passed to the underlying ChatOpenAI.
+        call_kwargs = fake.invoke.call_args.kwargs
+        config = call_kwargs.get('config')
+        assert config is not None
+        assert 'provider=regolo' in config['tags']
+        assert 'model=Llama-3.3-70B-Instruct' in config['tags']
+        assert config['metadata']['provider'] == 'regolo'
+        assert config['metadata']['regolo_model'] == 'Llama-3.3-70B-Instruct'
+
+    def test_invoke_merges_user_supplied_config(self):
+        """User-supplied tags + metadata are preserved; Regolo tags appended."""
+        success_msg = MagicMock()
+        success_msg.additional_kwargs = {}
+        fake = MagicMock()
+        fake.invoke.return_value = success_msg
+
+        proxy = self._make_proxy(fake, model='mistral-small-4-119b')
+        user_config = {
+            'tags': ['user-trace-id-abc', 'feature=chat'],
+            'metadata': {'session_id': 'sess-42', 'provider': 'will-be-kept'},
+        }
+        proxy.invoke('hi', config=user_config)
+
+        config = fake.invoke.call_args.kwargs['config']
+        # User tags preserved
+        assert 'user-trace-id-abc' in config['tags']
+        assert 'feature=chat' in config['tags']
+        # Regolo tags appended
+        assert 'provider=regolo' in config['tags']
+        assert 'model=mistral-small-4-119b' in config['tags']
+        # User metadata preserved (including pre-set provider — setdefault honors it)
+        assert config['metadata']['session_id'] == 'sess-42'
+        assert config['metadata']['provider'] == 'will-be-kept'
+        # regolo_model still added since user didn't set it
+        assert config['metadata']['regolo_model'] == 'mistral-small-4-119b'
+
+
+# ---------------------------------------------------------------------------
 # Regolo error taxonomy
 # ---------------------------------------------------------------------------
 
