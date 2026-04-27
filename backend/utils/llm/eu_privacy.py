@@ -29,19 +29,55 @@ from utils.llm.clients import get_model
 
 logger = logging.getLogger('eu_privacy')
 
-# Features that Regolo can serve today (Phase 1). Each entry must have a
-# corresponding model in MODEL_QOS_PROFILES['eu'] in clients.py.
+# Features that Regolo can serve today (Phase 1). Every entry below must
+# have a corresponding model in `_EU_FEATURE_MODELS`. The set covers every
+# Omi LLM feature except the hard-blocked ones (chat_agent → Anthropic-only,
+# web_search → Perplexity-only, vision → no PAYG vision model on Regolo).
+#
+# Picks are based on live latency + JSON-quality probes (Apr 27 2026); see
+# docs/04-model-mapping.md for the empirical data driving the mapping.
 REGOLO_SUPPORTED_FEATURES: frozenset[str] = frozenset(
     {
-        'chat_responses',
+        # Conversation post-processing (mid-tier)
         'conv_action_items',
         'conv_structure',
         'conv_app_result',
-        'memories',
-        'memory_conflict',
-        'goals_advice',
-        'app_generator',
         'daily_summary',
+        'external_structure',
+        # Conversation lightweight (nano-tier)
+        'conv_app_select',
+        'conv_folder',
+        'conv_discard',
+        'daily_summary_simple',
+        # Memory & knowledge (mid-tier extraction)
+        'memories',
+        'learnings',
+        'memory_conflict',
+        'knowledge_graph',  # LLM extraction, NOT search — search is in EMBEDDING_DEPENDENT_FEATURES
+        # Memory lightweight (nano-tier)
+        'memory_category',
+        # Chat (mid-tier — chat_agent is excluded; that's Anthropic-only)
+        'chat_responses',
+        'chat_extraction',
+        'chat_graph',
+        # Chat lightweight (nano-tier)
+        'session_titles',
+        # Features (mid-tier)
+        'goals',
+        'goals_advice',
+        'notifications',
+        'proactive_notification',
+        'app_generator',
+        'persona_clone',
+        'persona_chat_premium',
+        'wrapped_analysis',
+        # Features lightweight (nano-tier)
+        'followup',
+        'smart_glasses',
+        'onboarding',
+        'app_integration',
+        'trends',
+        'persona_chat',
     }
 )
 
@@ -56,14 +92,19 @@ REGOLO_HARD_BLOCKED_FEATURES: frozenset[str] = frozenset(
     }
 )
 
-# Embedding-dependent features. Phase 1 keeps embeddings on OpenAI by
-# carving them out — but EU mode HARD-BLOCKS them rather than silently
-# leaking. Phase 2 will introduce the Qwen3-Embedding-8B 4096-dim adapter
-# and graduate these to REGOLO_SUPPORTED_FEATURES.
+# Embedding-dependent features (search-side). Phase 1 keeps embeddings on
+# OpenAI by carving them out — but EU mode HARD-BLOCKS them rather than
+# silently leaking. Phase 2 will introduce the Qwen3-Embedding-8B 4096-dim
+# adapter and graduate these to REGOLO_SUPPORTED_FEATURES.
+#
+# Note: `knowledge_graph` (LLM-side entity/relationship extraction, in
+# REGOLO_SUPPORTED_FEATURES above) is distinct from `knowledge_graph_search`
+# (vector lookup over the graph, listed here). Same domain, different code
+# paths — only the search side is embedding-dependent.
 EMBEDDING_DEPENDENT_FEATURES: frozenset[str] = frozenset(
     {
         'memory_search',
-        'knowledge_graph',
+        'knowledge_graph_search',
         'screen_activity_search',
     }
 )
@@ -154,18 +195,69 @@ def clear_eu_privacy_context() -> None:
     _eu_privacy_ctx.set(None)
 
 
-# Default Phase 1 model picks for the EU profile. These match the live-probe
-# results in desktop/docs/REGOLO_INTEGRATION.md (Apr 2026).
+# Phase 1 EU model picks. Two-tier strategy mirroring upstream's gpt-4.1-mini
+# vs gpt-4.1-nano split:
+#
+#   _EU_MID  = Llama-3.3-70B-Instruct (€0.60/€2.70 per 1M, ~0.8s p50, clean JSON,
+#              tool-calling verified). Drop-in for every gpt-4.1-mini and
+#              gpt-5.4-mini call site.
+#   _EU_NANO = Llama-3.1-8B-Instruct (€0.05/€0.25 per 1M, ~0.7s p50, clean JSON,
+#              tool-calling verified). Drop-in for every gpt-4.1-nano call site —
+#              12x cheaper than _EU_MID.
+#
+# Special:
+#   app_generator — kept on _EU_MID for now. If profile metrics show it
+#       primarily generates code, swap to qwen3-coder-next (€0.50/€2.00, 0.47s).
+#
+# We deliberately do NOT use the qwen thinking models (minimax-m2.5,
+# qwen3.5-9b, qwen3.5-122b, qwen3.6-27b) as defaults despite the price/quality
+# of qwen3.5-9b being attractive (€0.07/€0.35) — every call has to set the
+# enable_thinking knob (handled in clients.py) and minimax leaks
+# reasoning_content. Non-thinking Llama models keep the wire shape simpler
+# and the latency lower for chat. Operators can override per-feature via
+# MODEL_QOS_<FEATURE> env vars to use the qwen thinking models when their
+# feature genuinely benefits from chain-of-thought.
+_EU_MID = 'regolo/Llama-3.3-70B-Instruct'
+_EU_NANO = 'regolo/Llama-3.1-8B-Instruct'
+
 _EU_FEATURE_MODELS: dict[str, str] = {
-    'chat_responses': 'regolo/minimax-m2.5',
-    'conv_action_items': 'regolo/Llama-3.3-70B-Instruct',
-    'conv_structure': 'regolo/Llama-3.3-70B-Instruct',
-    'conv_app_result': 'regolo/Llama-3.3-70B-Instruct',
-    'memories': 'regolo/qwen3.5-9b',
-    'memory_conflict': 'regolo/qwen3.5-9b',
-    'goals_advice': 'regolo/Llama-3.3-70B-Instruct',
-    'app_generator': 'regolo/Llama-3.3-70B-Instruct',
-    'daily_summary': 'regolo/Llama-3.3-70B-Instruct',
+    # Conversation post-processing — mid-tier (matches gpt-5.4-mini upstream)
+    'conv_action_items': _EU_MID,
+    'conv_structure': _EU_MID,
+    'conv_app_result': _EU_MID,
+    'daily_summary': _EU_MID,
+    'external_structure': _EU_MID,
+    # Conversation lightweight — nano-tier (matches gpt-4.1-nano upstream)
+    'conv_app_select': _EU_NANO,
+    'conv_folder': _EU_NANO,
+    'conv_discard': _EU_NANO,
+    'daily_summary_simple': _EU_NANO,
+    # Memory & knowledge — quality-sensitive extraction stays mid
+    'memories': _EU_MID,
+    'learnings': _EU_MID,
+    'memory_conflict': _EU_MID,
+    'knowledge_graph': _EU_MID,
+    'memory_category': _EU_NANO,
+    # Chat — mid-tier
+    'chat_responses': _EU_MID,
+    'chat_extraction': _EU_MID,
+    'chat_graph': _EU_MID,
+    'session_titles': _EU_NANO,
+    # Features
+    'goals': _EU_MID,
+    'goals_advice': _EU_MID,
+    'notifications': _EU_MID,
+    'proactive_notification': _EU_MID,
+    'app_generator': _EU_MID,  # could swap to regolo/qwen3-coder-next if code-heavy
+    'persona_clone': _EU_MID,
+    'persona_chat_premium': _EU_MID,
+    'wrapped_analysis': _EU_MID,  # was google/gemini-3-flash-preview upstream
+    'followup': _EU_NANO,
+    'smart_glasses': _EU_NANO,
+    'onboarding': _EU_NANO,
+    'app_integration': _EU_NANO,
+    'trends': _EU_NANO,
+    'persona_chat': _EU_NANO,
 }
 
 
