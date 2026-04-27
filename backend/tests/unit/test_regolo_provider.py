@@ -411,6 +411,99 @@ class TestRegoloProxyAsyncAndStreaming:
 
 
 # ---------------------------------------------------------------------------
+# _RegoloChatProxy retry policy (M1.3)
+#
+# Retry budget: 3 attempts total on 429 (initial + 2), 1 retry on 5xx, 0 on
+# auth/forbidden/not-found. Honors Retry-After when present. Tests patch
+# time.sleep / asyncio.sleep so they don't actually wait.
+# ---------------------------------------------------------------------------
+
+
+class TestRegoloProxyRetryPolicy:
+    def _make_proxy(self, fake_chat_openai: Any):
+        from utils.llm.clients import _RegoloChatProxy
+
+        return _RegoloChatProxy(model='Llama-3.3-70B-Instruct', default=fake_chat_openai, ctor_kwargs={})
+
+    def _build_429(self, retry_after: str = '0') -> Exception:
+        exc = MagicMock(spec=Exception)
+        exc.status_code = 429
+        exc.response = MagicMock()
+        exc.response.headers = {'Retry-After': retry_after}
+        return exc
+
+    def _build_5xx(self, status: int = 503) -> Exception:
+        exc = Exception(f'upstream {status}')
+        exc.status_code = status  # type: ignore[attr-defined]
+        return exc
+
+    def test_invoke_retries_429_with_retry_after(self):
+        """Two 429s with Retry-After=0 then success — total 3 attempts, both
+        retries honor Retry-After (0s) instead of using the default backoff."""
+        success_msg = MagicMock()
+        success_msg.additional_kwargs = {'tool_calls': []}
+
+        side_effects = [self._build_429('0'), self._build_429('0'), success_msg]
+        fake = MagicMock()
+        fake.invoke.side_effect = side_effects
+
+        proxy = self._make_proxy(fake)
+        sleeps: list[float] = []
+        with patch('utils.llm.clients.time.sleep', side_effect=sleeps.append):
+            result = proxy.invoke('hi')
+
+        assert result is success_msg
+        assert fake.invoke.call_count == 3
+        assert sleeps == [0.0, 0.0]  # Retry-After=0 honored both times
+
+    def test_invoke_max_3_attempts_on_persistent_429(self):
+        from utils.llm.regolo_errors import RegoloRateLimitError
+
+        fake = MagicMock()
+        fake.invoke.side_effect = [self._build_429('0'), self._build_429('0'), self._build_429('0')]
+
+        proxy = self._make_proxy(fake)
+        with patch('utils.llm.clients.time.sleep'):
+            with pytest.raises(RegoloRateLimitError):
+                proxy.invoke('hi')
+
+        # 3 total attempts: initial + 2 retries.
+        assert fake.invoke.call_count == 3
+
+    def test_invoke_retries_5xx_once_then_raises(self):
+        from utils.llm.regolo_errors import RegoloServiceError
+
+        fake = MagicMock()
+        fake.invoke.side_effect = [self._build_5xx(503), self._build_5xx(503)]
+
+        proxy = self._make_proxy(fake)
+        with patch('utils.llm.clients.time.sleep') as mock_sleep:
+            with pytest.raises(RegoloServiceError):
+                proxy.invoke('hi')
+
+        # 2 total attempts: initial + 1 retry, then re-raise.
+        assert fake.invoke.call_count == 2
+        # One sleep between the two attempts.
+        assert mock_sleep.call_count == 1
+
+    def test_invoke_does_not_retry_401(self):
+        from utils.llm.regolo_errors import RegoloAuthError
+
+        exc = Exception('unauthorized')
+        exc.status_code = 401  # type: ignore[attr-defined]
+        fake = MagicMock()
+        fake.invoke.side_effect = exc
+
+        proxy = self._make_proxy(fake)
+        with patch('utils.llm.clients.time.sleep') as mock_sleep:
+            with pytest.raises(RegoloAuthError):
+                proxy.invoke('hi')
+
+        assert fake.invoke.call_count == 1
+        mock_sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Regolo error taxonomy
 # ---------------------------------------------------------------------------
 
