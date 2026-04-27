@@ -12,6 +12,7 @@ import tiktoken
 
 from models.structured import Structured
 from utils.byok import get_byok_key
+from utils.llm.regolo_errors import RegoloError, classify_regolo_error
 from utils.llm.usage_tracker import get_usage_callback
 
 logger = logging.getLogger(__name__)
@@ -138,13 +139,85 @@ class _RegoloChatProxy:
             return _cached_openai_chat(self._model, byok, self._ctor_kwargs)
         return self._default
 
-    def __getattr__(self, name: str):
+    def invoke(self, *args: Any, **kwargs: Any) -> Any:
+        """Wrap ChatOpenAI.invoke with reasoning-content stripping and Regolo
+        error classification.
+
+        - On success: drops `reasoning_content` from the assistant message so
+          MiniMax / Qwen3.x thinking output never leaks into chat history.
+        - On exception: re-raises a typed `RegoloError` subclass (auth, rate-
+          limit, model-not-found, service) so callers can branch on type
+          rather than parsing httpx error strings.
+        """
+        target = self._resolve()
+        try:
+            result = target.invoke(*args, **kwargs)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+        return strip_reasoning_content(result)
+
+    async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
+        """Async equivalent of invoke — same strip-on-success / classify-on-error contract."""
+        target = self._resolve()
+        try:
+            result = await target.ainvoke(*args, **kwargs)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+        return strip_reasoning_content(result)
+
+    def stream(self, *args: Any, **kwargs: Any):
+        """Sync streaming wrapper — strips reasoning_content per chunk and
+        classifies exceptions raised during iteration. Yields the same chunk
+        objects langchain would yield, mutated in place."""
+        target = self._resolve()
+        try:
+            iterator = target.stream(*args, **kwargs)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+
+        try:
+            for chunk in iterator:
+                yield strip_reasoning_content(chunk)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+
+    async def astream(self, *args: Any, **kwargs: Any):
+        """Async streaming wrapper — same contract as `stream` but async."""
+        target = self._resolve()
+        try:
+            iterator = target.astream(*args, **kwargs)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+
+        try:
+            async for chunk in iterator:
+                yield strip_reasoning_content(chunk)
+        except RegoloError:
+            raise
+        except Exception as exc:
+            raise classify_regolo_error(exc) from exc
+
+    def __getattr__(self, name: str) -> Any:
+        # Everything else (bind_tools, batch, abatch, with_structured_output,
+        # with_retry, ...) falls through to the underlying ChatOpenAI. The
+        # invoke/ainvoke/stream/astream paths above cover the four hand-offs
+        # that touch reasoning_content and Regolo error envelopes.
         return getattr(self._resolve(), name)
 
-    def __or__(self, other):
+    def __or__(self, other: Any) -> Any:
         return self._resolve() | other
 
-    def __ror__(self, other):
+    def __ror__(self, other: Any) -> Any:
         return other | self._resolve()
 
 
