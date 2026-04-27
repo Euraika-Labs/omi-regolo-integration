@@ -5,13 +5,31 @@ This doc explains why each Omi LLM feature is mapped to a specific Regolo model 
 
 ## TL;DR
 
-- **Mid-tier (everything mid-quality)** → `regolo/Llama-3.3-70B-Instruct` (€0.60/€2.70 per 1M, ~0.8s p50, clean JSON, tool-calling verified). Drop-in replacement for `gpt-4.1-mini` and `gpt-5.4-mini`.
-- **Nano-tier (lightweight classification)** → `regolo/Llama-3.1-8B-Instruct` (€0.05/€0.25 per 1M, ~0.7s p50). 12× cheaper than mid-tier; drop-in for `gpt-4.1-nano`.
+- **Mid-tier** → `regolo/mistral-small-4-119b` (€0.50/€2.10 per 1M, **p50 0.43s, p90 0.44s**, clean JSON, tool-calling verified). Drop-in for `gpt-4.1-mini` and `gpt-5.4-mini`.
+- **Nano-tier** → `regolo/Llama-3.1-8B-Instruct` (€0.05/€0.25 per 1M, p50 0.62s, p90 0.72s). 10× cheaper than mid-tier.
 - **Embeddings** (Phase 2) → `Qwen3-Embedding-8B` (4096-dim, €0.001/req).
-- **Tool-calling** → either tier works; both verified against the `get_weather` smoke test.
 - **HARD-BLOCK** → vision, web_search, chat_agent, all embedding-search features (no silent fallback to non-EU).
 
-The qwen-3.x thinking models are NOT defaults despite attractive pricing — they all need `enable_thinking=False` injected per call (handled in `_RegoloChatProxy`), and `minimax-m2.5` additionally leaks a non-OpenAI `reasoning_content` field that has to be stripped before persistence. Operators wanting their reasoning depth can override per-feature via the upstream `MODEL_QOS_<FEATURE>=regolo/qwen3.5-9b` env-var pattern.
+**The thinking models — minimax-m2.5, qwen3.5-122b, qwen3.5-9b, qwen3.6-27b — are NOT defaults.** Multi-sample probe revealed:
+
+| Model | n | p50 | p90 | failure mode |
+|---|---|---|---|---|
+| minimax-m2.5 | 2/5 | 59.83s | 59.83s | **3 of 5 calls timed out (60s)**; working calls 48-60s |
+| qwen3.5-122b | 5/5 | 0.36s | **2.25s** | bimodal — fast 80% of the time, 6× slower 20% of the time |
+| qwen3.5-9b | 4/5 | 2.47s | **42.33s** | one 60s timeout, very inconsistent |
+| qwen3.6-27b | (single-shot) | 5.62s | n/a | always slow |
+
+Compare to the consistent non-thinking models:
+
+| Model | n | p50 | p90 | spread |
+|---|---|---|---|---|
+| **mistral-small-4-119b** | 5/5 | 0.43s | 0.44s | **±2%** |
+| Llama-3.3-70B-Instruct | 5/5 | 0.83s | 0.84s | ±1% |
+| Llama-3.1-8B-Instruct | 5/5 | 0.62s | 0.72s | ±16% |
+
+For user-facing chat where typing-indicator latency matters, the thinking models' tail behavior is a UX bug. Operators who genuinely need reasoning depth can override per-feature via the upstream `MODEL_QOS_<FEATURE>=regolo/qwen3.5-122b` env-var pattern. For batch features that tolerate slow outliers, the thinking models are still in `_REGOLO_THINKING_MODELS` so the knob is auto-injected when picked.
+
+Why mistral over Llama-3.3-70B for the mid-tier default: mistral is 2× faster, 17%/22% cheaper, equally consistent, and equally good at tool calling. Llama-3.3-70B was my initial pick for "household name" reasons; the data overruled the heuristic.
 
 ## Empirical data
 
@@ -65,7 +83,7 @@ Phase 1 keeps embeddings on OpenAI (3072-dim) and HARD-BLOCKS embedding-dependen
 
 The mapping below is what `eu_privacy.py` ships with. Each pick is justified by the upstream tier and the empirical data above.
 
-### Mid-tier — `regolo/Llama-3.3-70B-Instruct`
+### Mid-tier — `regolo/mistral-small-4-119b`
 
 Used wherever upstream's `premium` profile picks `gpt-4.1-mini` or `gpt-5.4-mini`. These are quality-sensitive workloads (structured extraction, summarization, reasoning).
 
@@ -80,7 +98,7 @@ Used wherever upstream's `premium` profile picks `gpt-4.1-mini` or `gpt-5.4-mini
 | `learnings` | gpt-5.4-mini | Mid-tier quality |
 | `memory_conflict` | gpt-4.1-mini | Quality-sensitive |
 | `knowledge_graph` | gpt-4.1-mini | LLM extraction (NOT search — see hard-block list) |
-| `chat_responses` | gpt-5.4-mini | Replaces scoping doc's `minimax-m2.5` pick — Llama is 3× faster (0.82s vs 2.71s) for interactive chat |
+| `chat_responses` | gpt-5.4-mini | Mistral is 2× faster than Llama-3.3-70B (0.43s vs 0.83s) and 6× more consistent than qwen3.5-122b (P90 0.44s vs 2.25s). Replaces the scoping doc's `minimax-m2.5` pick which had a 60% timeout rate. |
 | `chat_extraction` | gpt-4.1-mini | Quality-sensitive |
 | `chat_graph` | gpt-4.1-mini | Quality-sensitive |
 | `goals` | gpt-4.1-mini | Quality-sensitive |

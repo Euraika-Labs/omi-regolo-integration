@@ -196,28 +196,30 @@ def clear_eu_privacy_context() -> None:
 
 
 # Phase 1 EU model picks. Two-tier strategy mirroring upstream's gpt-4.1-mini
-# vs gpt-4.1-nano split:
+# vs gpt-4.1-nano split. Picks driven by a 5-sample latency probe (Apr 27 2026
+# — see docs/04-model-mapping.md for raw data):
 #
-#   _EU_MID  = Llama-3.3-70B-Instruct (€0.60/€2.70 per 1M, ~0.8s p50, clean JSON,
-#              tool-calling verified). Drop-in for every gpt-4.1-mini and
-#              gpt-5.4-mini call site.
-#   _EU_NANO = Llama-3.1-8B-Instruct (€0.05/€0.25 per 1M, ~0.7s p50, clean JSON,
-#              tool-calling verified). Drop-in for every gpt-4.1-nano call site —
-#              12x cheaper than _EU_MID.
+#   _EU_MID  = mistral-small-4-119b   (€0.50/€2.10, p50 0.43s, p90 0.44s,
+#                                      tool-calling verified, no thinking quirks)
+#   _EU_NANO = Llama-3.1-8B-Instruct  (€0.05/€0.25, p50 0.62s, p90 0.72s,
+#                                      tool-calling verified)
 #
-# Special:
-#   app_generator — kept on _EU_MID for now. If profile metrics show it
-#       primarily generates code, swap to qwen3-coder-next (€0.50/€2.00, 0.47s).
+# Why NOT thinking models as defaults (minimax-m2.5, qwen3.5-9b/122b/3.6-27b):
+# the multi-sample probe revealed all of them have catastrophic tail latency
+# on Regolo's PAYG tier. minimax-m2.5 had 3/5 timeouts at 60s (working calls
+# took 48-60s). qwen3.5-122b is bimodal — p50 0.36s but p90 2.25s. qwen3.5-9b
+# similar — p50 2.5s, p90 42s, one timeout. Llama-3.3-70B and
+# mistral-small-4-119b were both rock-solid (P90 within 2% of P50).
 #
-# We deliberately do NOT use the qwen thinking models (minimax-m2.5,
-# qwen3.5-9b, qwen3.5-122b, qwen3.6-27b) as defaults despite the price/quality
-# of qwen3.5-9b being attractive (€0.07/€0.35) — every call has to set the
-# enable_thinking knob (handled in clients.py) and minimax leaks
-# reasoning_content. Non-thinking Llama models keep the wire shape simpler
-# and the latency lower for chat. Operators can override per-feature via
-# MODEL_QOS_<FEATURE> env vars to use the qwen thinking models when their
-# feature genuinely benefits from chain-of-thought.
-_EU_MID = 'regolo/Llama-3.3-70B-Instruct'
+# Why mistral over Llama-3.3-70B for mid-tier: 2× faster (0.43s vs 0.83s),
+# 17% cheaper input, 22% cheaper output, equally consistent, equal
+# tool-calling reliability. Llama wins on "household name" but loses on
+# every measured dimension.
+#
+# Operators retain MODEL_QOS_<FEATURE>=regolo/<model> overrides for cases
+# where a thinking model's reasoning genuinely beats mistral's instruct
+# tuning (e.g. a complex extraction pipeline that's tolerant of tail latency).
+_EU_MID = 'regolo/mistral-small-4-119b'
 _EU_NANO = 'regolo/Llama-3.1-8B-Instruct'
 
 _EU_FEATURE_MODELS: dict[str, str] = {
