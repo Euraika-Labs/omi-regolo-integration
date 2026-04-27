@@ -481,9 +481,20 @@ def _get_or_create_openrouter_llm(
 _REGOLO_BASE_URL = "https://api.regolo.ai/v1"
 
 # Models that require chat_template_kwargs.enable_thinking=False or they will
-# return content=null with finish_reason=length. Verified via live probes
-# (Apr 2026) — see desktop/docs/REGOLO_INTEGRATION.md.
-_REGOLO_THINKING_MODELS = frozenset({'minimax-m2.5', 'qwen3.5-122b'})
+# burn the entire output budget on hidden reasoning tokens (and the visible
+# completion comes back as content=null with finish_reason=length). Live-
+# probed Apr 27 2026 — see docs/04-model-mapping.md for raw probe results.
+#
+# Every model in the qwen-3.x family + minimax-m2.5 falls into this bucket.
+# Llama, mistral, gpt-oss, gemma, apertus, and qwen3-coder-next do NOT.
+_REGOLO_THINKING_MODELS = frozenset(
+    {
+        'minimax-m2.5',
+        'qwen3.5-122b',
+        'qwen3.5-9b',
+        'qwen3.6-27b',
+    }
+)
 
 
 def _get_or_create_regolo_llm(
