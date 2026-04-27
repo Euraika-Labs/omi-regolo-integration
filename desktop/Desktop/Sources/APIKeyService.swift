@@ -16,25 +16,12 @@ import Foundation
 /// Anthropic, Firebase, and Calendar keys are still served via /v1/config/api-keys.
 
 /// Keys that participate in the BYOK free-plan flow.
-///
-/// Required providers (`requiredProviders`) gate the free-plan activation —
-/// the user must supply keys for all of them. Optional providers (e.g.
-/// `.regolo` for EU Privacy Mode) can be added without breaking the gate;
-/// they are sent on every request when configured but are not required for
-/// activation. This mirrors the backend split between
-/// `_BYOK_REQUIRED_PROVIDERS` and `_BYOK_ALLOWED_PROVIDERS`.
 enum BYOKProvider: String, CaseIterable {
     case openai
     case anthropic
     case gemini
     case deepgram
     case regolo
-
-    /// Providers required to activate the BYOK free plan. Adding a new
-    /// optional provider (`.regolo`) MUST NOT extend this list.
-    static let requiredProviders: [BYOKProvider] = [.openai, .anthropic, .gemini, .deepgram]
-
-    var isRequired: Bool { Self.requiredProviders.contains(self) }
 
     var storageKey: String {
         switch self {
@@ -62,7 +49,18 @@ enum BYOKProvider: String, CaseIterable {
         case .anthropic: return "Anthropic"
         case .gemini: return "Gemini"
         case .deepgram: return "Deepgram"
-        case .regolo: return "Regolo (EU Privacy)"
+        case .regolo: return "Regolo (EU)"
+        }
+    }
+
+    /// True when this provider key is required for the BYOK free-plan subscription
+    /// bypass. Optional providers (regolo) can be configured without affecting the
+    /// gate — users enable them per-feature (e.g. EU Privacy Mode) without needing
+    /// to replace their existing Anthropic/Gemini/OpenAI/Deepgram keys.
+    var isRequiredForFreePlan: Bool {
+        switch self {
+        case .openai, .anthropic, .gemini, .deepgram: return true
+        case .regolo: return false
         }
     }
 }
@@ -217,12 +215,14 @@ final class APIKeyService: ObservableObject {
         nonEmptyStatic(UserDefaults.standard.string(forKey: provider.storageKey))
     }
 
-    /// True when the user has supplied keys for all REQUIRED BYOK providers.
-    /// The subscription-bypass gate: when this is true, the user is on the free
-    /// plan and we attach their keys to every backend request. Optional
-    /// providers (e.g. `.regolo`) do not affect this gate.
+    /// True when the user has supplied keys for all REQUIRED BYOK providers
+    /// (OpenAI, Anthropic, Gemini, Deepgram). Optional providers like regolo
+    /// don't gate free-plan eligibility — they enable opt-in features such as
+    /// EU Privacy Mode without affecting the subscription bypass.
     nonisolated static var isByokActive: Bool {
-        BYOKProvider.requiredProviders.allSatisfy { byokKey($0) != nil }
+        BYOKProvider.allCases
+            .filter { $0.isRequiredForFreePlan }
+            .allSatisfy { byokKey($0) != nil }
     }
 
     /// SHA-256 fingerprint of a key, used by the backend to detect when the
@@ -241,5 +241,17 @@ final class APIKeyService: ObservableObject {
             }
         }
         return out
+    }
+
+    // MARK: - EU Privacy Mode
+
+    /// UserDefaults key for the EU Privacy Mode toggle.  When true, APIClient
+    /// attaches the X-Privacy-Mode header so the backend routes LLM workloads
+    /// through regolo.ai (Italy-hosted) instead of Claude/Gemini.
+    nonisolated static let euPrivacyModeStorageKey = "eu_privacy_mode_enabled"
+
+    nonisolated static var isEUPrivacyModeEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: euPrivacyModeStorageKey) }
+        set { UserDefaults.standard.set(newValue, forKey: euPrivacyModeStorageKey) }
     }
 }
