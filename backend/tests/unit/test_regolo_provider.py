@@ -232,6 +232,81 @@ class TestStripReasoningContent:
 
 
 # ---------------------------------------------------------------------------
+# _RegoloChatProxy.invoke — sync hand-off (M1.1)
+#
+# These tests exist because the proxy used to be a transparent forwarder via
+# __getattr__, so reasoning_content leaked and raw httpx errors bubbled up
+# unclassified. The wrapped invoke is the M1.1 patch that fixed that.
+# ---------------------------------------------------------------------------
+
+
+class TestRegoloProxyInvoke:
+    def _make_proxy(self, fake_chat_openai: Any):
+        """Build a proxy whose _resolve() returns the given fake."""
+        from utils.llm.clients import _RegoloChatProxy
+
+        # Pass the fake as `default`; with no BYOK key set, _resolve() returns it.
+        return _RegoloChatProxy(model='Llama-3.3-70B-Instruct', default=fake_chat_openai, ctor_kwargs={})
+
+    def test_invoke_strips_reasoning_content_on_success(self):
+        msg = MagicMock()
+        msg.additional_kwargs = {'reasoning_content': 'thinking out loud...', 'tool_calls': []}
+
+        fake = MagicMock()
+        fake.invoke.return_value = msg
+
+        proxy = self._make_proxy(fake)
+        result = proxy.invoke('hello')
+
+        assert result is msg
+        assert 'reasoning_content' not in msg.additional_kwargs
+        assert 'tool_calls' in msg.additional_kwargs  # untouched
+
+    def test_invoke_classifies_401_as_auth_error(self):
+        from utils.llm.regolo_errors import RegoloAuthError
+
+        exc = Exception('unauthorized')
+        exc.status_code = 401  # type: ignore[attr-defined]
+
+        fake = MagicMock()
+        fake.invoke.side_effect = exc
+
+        proxy = self._make_proxy(fake)
+        with pytest.raises(RegoloAuthError):
+            proxy.invoke('hello')
+
+    def test_invoke_classifies_429_with_retry_after(self):
+        from utils.llm.regolo_errors import RegoloRateLimitError
+
+        exc = MagicMock(spec=Exception)
+        exc.status_code = 429
+        exc.response = MagicMock()
+        exc.response.headers = {'Retry-After': '15'}
+
+        fake = MagicMock()
+        fake.invoke.side_effect = exc
+
+        proxy = self._make_proxy(fake)
+        with pytest.raises(RegoloRateLimitError) as info:
+            proxy.invoke('hello')
+
+        assert info.value.retry_after_s == 15.0
+
+    def test_invoke_classifies_5xx_as_service_error(self):
+        from utils.llm.regolo_errors import RegoloServiceError
+
+        exc = Exception('upstream broke')
+        exc.status_code = 503  # type: ignore[attr-defined]
+
+        fake = MagicMock()
+        fake.invoke.side_effect = exc
+
+        proxy = self._make_proxy(fake)
+        with pytest.raises(RegoloServiceError):
+            proxy.invoke('hello')
+
+
+# ---------------------------------------------------------------------------
 # Regolo error taxonomy
 # ---------------------------------------------------------------------------
 
