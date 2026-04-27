@@ -44,7 +44,6 @@ enum BYOKValidator {
         headers: ["Authorization": "Token \(trimmed)"]
       )
     case .regolo:
-      // Regolo is OpenAI-compatible, hosted in Italy. Used for EU Privacy Mode.
       return await ping(
         url: URL(string: "https://api.regolo.ai/v1/models")!,
         headers: ["Authorization": "Bearer \(trimmed)"]
