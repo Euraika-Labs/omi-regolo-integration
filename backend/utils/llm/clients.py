@@ -245,6 +245,62 @@ class _OpenAIEmbeddingsProxy:
 
 
 # ---------------------------------------------------------------------------
+# Regolo embeddings (M2.5)
+#
+# Qwen3-Embedding-8B is 4096-dim; OpenAI text-embedding-3-large is 3072-dim.
+# Pinecone enforces a fixed dimensionality at index creation time, so the
+# 4096-dim vectors CANNOT share an index with the existing 3072-dim ones.
+# Production deployment depends on a SEPARATE Pinecone index provisioned at
+# 4096-dim, surfaced via the PINECONE_INDEX_NAME_EU env var. Until that env
+# var is set, _RegoloEmbeddingProxy.embed_documents/embed_query construct
+# fine but writes/reads will hit the wrong index — see eu_privacy
+# .eu_embedding_index_provisioned() which gates the routing decision.
+# ---------------------------------------------------------------------------
+_REGOLO_EMBEDDING_MODEL = 'Qwen3-Embedding-8B'
+_REGOLO_EMBEDDING_DIM = 4096
+
+
+class _RegoloEmbeddingProxy:
+    """Embeddings client routed to api.regolo.ai/v1 with BYOK Regolo key
+    preferred over the env REGOLO_API_KEY.
+
+    Mirrors `_OpenAIEmbeddingsProxy`'s shape so callers that handle
+    `embed_documents([content])` / `embed_query(text)` can swap proxies
+    without code changes. Same `__getattr__` fallthrough to forward any
+    other langchain Embeddings method to the underlying client.
+    """
+
+    __slots__ = ('_model', '_default', '_ctor_kwargs')
+
+    def __init__(self, model: str, default: OpenAIEmbeddings, ctor_kwargs: Dict[str, Any]):
+        object.__setattr__(self, '_model', model)
+        object.__setattr__(self, '_default', default)
+        object.__setattr__(self, '_ctor_kwargs', ctor_kwargs)
+
+    def _resolve(self) -> OpenAIEmbeddings:
+        byok = get_byok_key('regolo')
+        # Cache key includes provider tag so 'emb:<model>:<hash>' for OpenAI
+        # and 'emb-regolo:<model>:<hash>' for Regolo never collide if the
+        # same key happens to be used cross-provider (unlikely, but safe).
+        if byok:
+            cache_key = f"emb-regolo:{self._model}:{_hash_key(byok)}"
+            inst = _openai_cache.get(cache_key)
+            if inst is None:
+                inst = OpenAIEmbeddings(
+                    model=self._model,
+                    api_key=byok,
+                    base_url=_REGOLO_BASE_URL,
+                    **self._ctor_kwargs,
+                )
+                _openai_cache[cache_key] = inst
+            return inst
+        return self._default
+
+    def __getattr__(self, name: str):
+        return getattr(self._resolve(), name)
+
+
+# ---------------------------------------------------------------------------
 # Regolo retry policy (M1.3)
 #
 # Applied at the invoke / ainvoke hand-off in `_RegoloChatProxy`. NOT applied
@@ -1019,6 +1075,22 @@ embeddings = _OpenAIEmbeddingsProxy(
     default=_embeddings_default,
     ctor_kwargs={},
 )
+
+# Regolo embeddings (M2.5). Default client targets api.regolo.ai with the
+# env REGOLO_API_KEY; BYOK Regolo keys take precedence per _RegoloEmbeddingProxy
+# ._resolve. Only used when EU Privacy Mode is on AND
+# eu_privacy.eu_embedding_index_provisioned() is True (see PINECONE_INDEX_NAME_EU).
+_regolo_embeddings_default = OpenAIEmbeddings(
+    model=_REGOLO_EMBEDDING_MODEL,
+    api_key=os.environ.get('REGOLO_API_KEY', ''),
+    base_url=_REGOLO_BASE_URL,
+)
+regolo_embeddings = _RegoloEmbeddingProxy(
+    model=_REGOLO_EMBEDDING_MODEL,
+    default=_regolo_embeddings_default,
+    ctor_kwargs={},
+)
+
 parser = PydanticOutputParser(pydantic_object=Structured)
 
 encoding = tiktoken.encoding_for_model('gpt-4')
@@ -1032,6 +1104,17 @@ def num_tokens_from_string(string: str) -> int:
 
 def generate_embedding(content: str) -> List[float]:
     return embeddings.embed_documents([content])[0]
+
+
+def generate_regolo_embedding(content: str) -> List[float]:
+    """Generate a 4096-dim embedding via Qwen3-Embedding-8B on api.regolo.ai.
+
+    Used when EU Privacy Mode is on AND the EU-side Pinecone index has been
+    provisioned. Callers MUST verify both conditions via
+    eu_privacy.eu_embedding_index_provisioned() before invoking — writing
+    a 4096-dim vector to the legacy 3072-dim index hard-fails server-side.
+    """
+    return regolo_embeddings.embed_documents([content])[0]
 
 
 def gemini_embed_query(text: str) -> List[float]:

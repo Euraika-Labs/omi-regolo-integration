@@ -278,6 +278,19 @@ def _hard_block_banner(feature: str) -> str:
     return f'Feature "{feature}" is unavailable in EU Privacy Mode.'
 
 
+def eu_embedding_index_provisioned() -> bool:
+    """True when the EU-side Pinecone index has been provisioned at 4096-dim
+    and surfaced via PINECONE_INDEX_NAME_EU. While False, embedding-dependent
+    features stay HARD_BLOCKED in EU mode — writing a 4096-dim vector to the
+    legacy 3072-dim index would hard-fail server-side.
+
+    Set this env var on the deploy that has the second Pinecone index
+    available. Until then M2.5 ships dormant: the proxy classes exist
+    but the dispatcher never routes embedding workloads to them.
+    """
+    return bool(os.environ.get('PINECONE_INDEX_NAME_EU', '').strip())
+
+
 def resolve_feature_model(uid: Optional[str], feature: str) -> FeatureRoute:
     """Decide where to route a feature for the given user.
 
@@ -292,7 +305,15 @@ def resolve_feature_model(uid: Optional[str], feature: str) -> FeatureRoute:
     if not eu_mode:
         return FeatureRoute(kind=FeatureRouteKind.PRIMARY, model=get_model(feature))
 
-    if feature in EMBEDDING_DEPENDENT_FEATURES or feature in REGOLO_HARD_BLOCKED_FEATURES:
+    if feature in REGOLO_HARD_BLOCKED_FEATURES:
+        return FeatureRoute(kind=FeatureRouteKind.HARD_BLOCK, model=None, banner=_hard_block_banner(feature))
+
+    if feature in EMBEDDING_DEPENDENT_FEATURES:
+        # M2.5: lift HARD_BLOCK to REGOLO route only when the EU-side Pinecone
+        # index is provisioned. Without it, the 4096-dim Qwen3 embedding
+        # would have nowhere safe to write — keep blocking.
+        if eu_embedding_index_provisioned():
+            return FeatureRoute(kind=FeatureRouteKind.REGOLO, model='regolo/Qwen3-Embedding-8B')
         return FeatureRoute(kind=FeatureRouteKind.HARD_BLOCK, model=None, banner=_hard_block_banner(feature))
 
     if feature in REGOLO_SUPPORTED_FEATURES:
