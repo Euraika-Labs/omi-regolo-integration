@@ -538,7 +538,10 @@ class TestRegoloProxyTelemetryTags:
         assert config['metadata']['regolo_model'] == 'Llama-3.3-70B-Instruct'
 
     def test_invoke_merges_user_supplied_config(self):
-        """User-supplied tags + metadata are preserved; Regolo tags appended."""
+        """User-supplied tags + metadata are preserved; Regolo attribution
+        always lands on `metadata['regolo_provider']` + `regolo_model` so a
+        caller cannot accidentally hide the Regolo attribution by pre-setting
+        their own `metadata['provider']`."""
         success_msg = MagicMock()
         success_msg.additional_kwargs = {}
         fake = MagicMock()
@@ -547,7 +550,7 @@ class TestRegoloProxyTelemetryTags:
         proxy = self._make_proxy(fake, model='mistral-small-4-119b')
         user_config = {
             'tags': ['user-trace-id-abc', 'feature=chat'],
-            'metadata': {'session_id': 'sess-42', 'provider': 'will-be-kept'},
+            'metadata': {'session_id': 'sess-42', 'provider': 'caller-app'},
         }
         proxy.invoke('hi', config=user_config)
 
@@ -558,11 +561,44 @@ class TestRegoloProxyTelemetryTags:
         # Regolo tags appended
         assert 'provider=regolo' in config['tags']
         assert 'model=mistral-small-4-119b' in config['tags']
-        # User metadata preserved (including pre-set provider — setdefault honors it)
+        # User metadata preserved
         assert config['metadata']['session_id'] == 'sess-42'
-        assert config['metadata']['provider'] == 'will-be-kept'
-        # regolo_model still added since user didn't set it
+        # User-supplied 'provider' kept (setdefault); attribution still works
+        # via the M1-private `regolo_provider` key + the tag channel.
+        assert config['metadata']['provider'] == 'caller-app'
+        assert config['metadata']['regolo_provider'] == 'regolo'
         assert config['metadata']['regolo_model'] == 'mistral-small-4-119b'
+
+    def test_invoke_does_not_double_stamp_model_tag(self):
+        """If the caller already supplied a `model=` tag (e.g. routing layer),
+        the proxy must not append a second one. Regression for an issue caught
+        in M1 review where the guard only checked `provider=regolo`."""
+        success_msg = MagicMock()
+        success_msg.additional_kwargs = {}
+        fake = MagicMock()
+        fake.invoke.return_value = success_msg
+
+        proxy = self._make_proxy(fake, model='Llama-3.3-70B-Instruct')
+        user_config = {'tags': ['model=user-supplied-name']}
+        proxy.invoke('hi', config=user_config)
+
+        tags = fake.invoke.call_args.kwargs['config']['tags']
+        model_tags = [t for t in tags if t.startswith('model=')]
+        assert model_tags == ['model=user-supplied-name'], model_tags
+        # provider=regolo still appended (idempotency only blocks duplicates).
+        assert 'provider=regolo' in tags
+
+    def test_invoke_idempotent_on_double_call(self):
+        """Calling the helper twice (e.g. proxy nested inside another proxy)
+        must not duplicate the provider tag."""
+        from utils.llm.clients import _inject_regolo_telemetry
+
+        args, kwargs = _inject_regolo_telemetry('Llama-3.3-70B-Instruct', ('input',), {})
+        args, kwargs = _inject_regolo_telemetry('Llama-3.3-70B-Instruct', args, kwargs)
+
+        tags = kwargs['config']['tags']
+        assert tags.count('provider=regolo') == 1
+        assert sum(1 for t in tags if t.startswith('model=')) == 1
 
 
 # ---------------------------------------------------------------------------
