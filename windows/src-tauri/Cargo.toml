@@ -1,0 +1,25 @@
+[package]
+name = "omi-windows"
+version = "0.1.0"
+description = "Omi for Windows — Tauri shell that hosts the cross-platform omi backend"
+edition = "2021"
+
+[lib]
+# The `_lib` suffix is necessary so the lib name doesn't conflict with the bin
+# name on Windows; see https://github.com/rust-lang/cargo/issues/8519
+name = "omi_windows_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Spawning + monitoring the omi-desktop-backend.exe child process
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time"] }
+# HTTP probe of the backend's /health endpoint
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
