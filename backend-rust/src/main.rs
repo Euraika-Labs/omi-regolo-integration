@@ -55,12 +55,15 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() {
-    // Open log file (same as Swift dev app: /tmp/omi-dev.log)
+    // Open log file. Cross-platform path: $TMPDIR (mac/linux) or %TEMP% (win) +
+    // omi-dev.log. Mirrors the Mac Swift dev app which used /tmp/omi-dev.log
+    // hardcoded; std::env::temp_dir() resolves to the same /tmp on mac/linux.
     // Wrap in LineWriter to flush after each line (ensures logs appear immediately)
+    let log_path = std::env::temp_dir().join("omi-dev.log");
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/omi-dev.log")
+        .open(&log_path)
         .expect("Failed to open log file");
     let line_writer = LineWriter::new(log_file);
 
