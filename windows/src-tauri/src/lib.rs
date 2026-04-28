@@ -10,8 +10,11 @@
 //     endpoint so the UI can show backend status
 //   - A Tauri command `get_backend_status` reports child-process state
 //
-// Out of scope here (later WPs): WGC capture, audio capture, BYOK storage,
-// system tray, Settings UI, real chat flows. WP-08 is just "shell + child".
+// Out of scope here (later WPs): WGC capture, audio capture, system tray,
+// Settings UI, real chat flows.
+//
+// Added in WP-15 in-app: BYOK key storage commands backed by Windows
+// Credential Manager via the `keyring` crate (pinned v3 — see spike doc).
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -169,6 +172,57 @@ fn greet(name: &str) -> String {
     format!("Hello, {name}! You've been greeted from Rust!")
 }
 
+// ===== BYOK key storage =====
+// Backed by `keyring` v3, which talks to Windows Credential Manager directly.
+// Each provider's key is stored as a separate Credential Manager entry under
+// the service "omi-byok-<provider>" / account "default". WP-15 spike (MR !18)
+// validated the round-trip end-to-end on this machine.
+
+const BYOK_ACCOUNT: &str = "default";
+
+fn byok_entry(provider: &str) -> Result<keyring::Entry, String> {
+    let provider = provider.trim().to_lowercase();
+    if provider.is_empty() {
+        return Err("provider must not be empty".into());
+    }
+    let service = format!("omi-byok-{provider}");
+    keyring::Entry::new(&service, BYOK_ACCOUNT).map_err(|e| format!("entry: {e}"))
+}
+
+#[tauri::command]
+fn set_byok_key(provider: String, value: String) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("value must not be empty (use delete_byok_key to clear)".into());
+    }
+    byok_entry(&provider)?
+        .set_password(&value)
+        .map_err(|e| format!("set: {e}"))
+}
+
+/// Returns Some(key) if a key is stored, None if no entry exists. Errors
+/// only on actual OS / API failures.
+#[tauri::command]
+fn get_byok_key(provider: String) -> Result<Option<String>, String> {
+    let entry = byok_entry(&provider)?;
+    match entry.get_password() {
+        Ok(s) => Ok(Some(s)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("get: {e}")),
+    }
+}
+
+#[tauri::command]
+fn delete_byok_key(provider: String) -> Result<(), String> {
+    let entry = byok_entry(&provider)?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        // Treat "no entry" as success — caller's invariant ("the key is now
+        // gone") holds either way.
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("delete: {e}")),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -192,7 +246,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             get_backend_health,
-            get_backend_status
+            get_backend_status,
+            set_byok_key,
+            get_byok_key,
+            delete_byok_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
